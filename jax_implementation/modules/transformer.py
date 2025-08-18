@@ -75,9 +75,11 @@ class Conv3d(nnx.Module):
         x = x.transpose(0, 2, 3, 4, 1)  # [batch, depth, height, width, channels]
         
         # Define dimension numbers for 3D convolution
-        # Using string format: ('NHWDC', 'HWDIO', 'NHWDC')
-        # N=batch, H=height, W=width, D=depth, C=channels, I=input_channels, O=output_channels
-        dn = ('NHWDC', 'HWDIO', 'NHWDC')
+        # N=batch, D=depth, H=height, W=width, C=channels, I=input_channels, O=output_channels
+        # The input is transposed to [batch, depth, height, width, channels]
+        # The kernel is [depth, height, width, in_channels, out_channels]
+        dn = ('NDHWC', 'DHWIO', 'NDHWC')
+        
         
         # Handle padding
         if self.padding == "SAME":
@@ -88,10 +90,14 @@ class Conv3d(nnx.Module):
             # Custom padding
             padding = ((0, 0), (0, 0), (0, 0))
         
-        # Apply 3D convolution
+        # Apply 3D convolution - ensure matching dtypes
+        kernel = self.kernel
+        if x.dtype != kernel.dtype:
+            kernel = kernel.astype(x.dtype)
+        
         output = lax.conv_general_dilated(
             lhs=x,                    # Input tensor
-            rhs=self.kernel,          # Kernel tensor
+            rhs=kernel,               # Kernel tensor
             window_strides=self.strides,  # Strides
             padding=padding,          # Padding
             lhs_dilation=(1, 1, 1),   # Input dilation
@@ -99,8 +105,11 @@ class Conv3d(nnx.Module):
             dimension_numbers=dn      # Dimension numbers
         )
         
-        # Add bias
-        output = output + self.bias
+        # Add bias - ensure matching dtype
+        bias = self.bias
+        if output.dtype != bias.dtype:
+            bias = bias.astype(output.dtype)
+        output = output + bias
         
         # Transpose back to [batch, channels, depth, height, width] format
         output = output.transpose(0, 4, 1, 2, 3)
@@ -309,13 +318,16 @@ class WanAttentionBlock(nnx.Module):
             block_mask: Optional attention mask
         """
         # Handle modulation
-        if e.ndim == 3:
-            modulation = self.modulation  # [1, 6, dim]
-            e = (modulation + e).reshape(6, -1)  # Split into 6 parts
-        elif e.ndim == 4:
-            modulation = self.modulation[:, :, None, :]  # [1, 6, 1, dim]
-            e = (modulation + e).reshape(e.shape[0], e.shape[1], 6, -1)
-            e = [e[:, :, i, :] for i in range(6)]
+        if e.ndim == 3: # Shape is [B, 6, dim]
+            modulation = self.modulation
+            e = modulation + e
+            # Correctly split 'e' into 6 parts without corrupting the batch dim
+            e = jnp.transpose(e, (1, 0, 2)) # Shape becomes [6, B, dim]
+        elif e.ndim == 4: # Shape is [B, seq_len, 6, dim]
+            modulation = self.modulation[:, None, :, :] # Shape becomes [1, 1, 6, dim]
+            e = modulation + e
+            # Correctly split 'e'
+            e = jnp.transpose(e, (2, 0, 1, 3)) # Shape becomes [6, B, seq_len, dim]
         
         # Self-attention
         out = mul_add_add(self.norm1(x), e[1], e[0])
@@ -330,7 +342,7 @@ class WanAttentionBlock(nnx.Module):
             return x
         
         x = cross_attn_ffn(x, context, e)
-        return x.astype(jnp.bfloat16)
+        return x  # Don't force dtype conversion
 
 
 class Head(nnx.Module):
@@ -379,17 +391,17 @@ class MLPProj(nnx.Module):
     
     def __init__(self, in_dim: int, out_dim: int):
         super().__init__()
-        # The PyTorch model defines a Sequential module named 'proj'. We
-        # replicate its structure here using a standard Python list. NNX will
-        # automatically discover the nested modules and create the correct
-        # parameter paths (e.g., 'proj.0.weight', 'proj.1.weight').
+        # This epsilon is the hardcoded default in torch.nn.LayerNorm.
+        # The original MLPProj module does NOT receive the main model's
+        # `eps` from the config, so we must match the PyTorch default here.
+        TORCH_DEFAULT_EPS = 1e-5
         self.proj = [
-            WanLayerNorm(in_dim, elementwise_affine=True, rngs=nnx.Rngs(0)),      # index 0
+            WanLayerNorm(in_dim, eps=TORCH_DEFAULT_EPS, elementwise_affine=True, rngs=nnx.Rngs(0)),      # index 0
             nnx.Linear(in_dim, in_dim, rngs=nnx.Rngs(0)),     # index 1
             # nn.GELU is just a function, so it doesn't have parameters and
             # doesn't need a placeholder in the list.
             nnx.Linear(in_dim, out_dim, rngs=nnx.Rngs(0)),    # index 3 in PyTorch
-            WanLayerNorm(out_dim, elementwise_affine=True, rngs=nnx.Rngs(0))      # index 4 in PyTorch
+            WanLayerNorm(out_dim, eps=TORCH_DEFAULT_EPS, elementwise_affine=True, rngs=nnx.Rngs(0))      # index 4 in PyTorch
         ]
     
     def __call__(self, image_embeds: jax.Array) -> jax.Array:
@@ -413,13 +425,13 @@ class WanModel(nnx.Module):
         patch_size: Tuple[int, int, int] = (1, 2, 2),
         text_len: int = 512,
         in_dim: int = 16,
-        dim: int = 2048,
-        ffn_dim: int = 8192,
+        dim: int = 1536,  # 1.3B model default
+        ffn_dim: int = 8960,  # 1.3B model default
         freq_dim: int = 256,
         text_dim: int = 4096,
         out_dim: int = 16,
-        num_heads: int = 16,
-        num_layers: int = 32,
+        num_heads: int = 12,  # 1.3B model default
+        num_layers: int = 30,  # 1.3B model default
         window_size: Tuple[int, int] = (-1, -1),
         qk_norm: bool = True,
         cross_attn_norm: bool = True,
@@ -543,6 +555,8 @@ class WanModel(nnx.Module):
         e = self.time_embedding_2(e)
         e0 = jax.nn.silu(e)
         e0 = self.time_projection_1(e0).reshape(b, 6, self.dim)  # [batch, 6, dim]
+        e = e.astype(jnp.float32)
+        e0 = e0.astype(jnp.float32)
         
         if self.inject_sample_info and fps is not None:
             fps_tensor = jnp.array(fps, dtype=jnp.int32)
@@ -584,7 +598,10 @@ class WanModel(nnx.Module):
         # Unpatchify
         x = self.unpatchify(x, grid_sizes)
         
-        return x.astype(jnp.float32)
+        # Return in float32 for compatibility with VAE decoder
+        if x.dtype == jnp.bfloat16:
+            x = x.astype(jnp.float32)
+        return x
     
     def unpatchify(self, x: jax.Array, grid_sizes: jax.Array) -> jax.Array:
         """

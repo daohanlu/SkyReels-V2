@@ -68,13 +68,13 @@ def create_jax_model_from_torch_config(model_id: str) -> Tuple[WanModel, Dict[st
         patch_size=tuple(config.get('patch_size', [1, 2, 2])),
         text_len=config.get('text_len', 512),
         in_dim=config.get('in_dim', 16),
-        dim=config.get('dim', 2048),
-        ffn_dim=config.get('ffn_dim', 8192),
+        dim=config.get('dim', 1536),  # 1.3B model uses 1536
+        ffn_dim=config.get('ffn_dim', 8960),  # 1.3B model uses 8960
         freq_dim=config.get('freq_dim', 256),
         text_dim=config.get('text_dim', 4096),
         out_dim=config.get('out_dim', 16),
-        num_heads=config.get('num_heads', 16),
-        num_layers=config.get('num_layers', 32),
+        num_heads=config.get('num_heads', 12),  # 1.3B model uses 12 heads
+        num_layers=config.get('num_layers', 30),  # 1.3B model uses 30 layers
         window_size=tuple(config.get('window_size', [-1, -1])),
         qk_norm=config.get('qk_norm', True),
         cross_attn_norm=config.get('cross_attn_norm', True),

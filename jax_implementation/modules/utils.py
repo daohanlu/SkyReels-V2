@@ -101,10 +101,14 @@ def apply_rope_1d(x: jax.Array, freq: jax.Array) -> jax.Array:
 
 def mul_add(x: jax.Array, y: jax.Array, z: jax.Array) -> jax.Array:
     """Element-wise multiplication and addition: x + y * z"""
-    return x.astype(jnp.float32) + y.astype(jnp.float32) * z.astype(jnp.float32)
+    orig_dtype = x.dtype
+    result = x.astype(jnp.float32) + y.astype(jnp.float32) * z.astype(jnp.float32)
+    return result.astype(orig_dtype)
 
 
 def mul_add_add(x: jax.Array, y: jax.Array, z: jax.Array) -> jax.Array:
     """Element-wise operation: x * (1 + y) + z"""
-    return x.astype(jnp.float32) * (1 + y) + z
+    orig_dtype = x.dtype
+    result = x.astype(jnp.float32) * (1 + y.astype(jnp.float32)) + z.astype(jnp.float32)
+    return result.astype(orig_dtype)
 

@@ -23,44 +23,6 @@ def _attention_causal(q: jax.Array, k: jax.Array, v: jax.Array) -> jax.Array:
     return attention_wrapper(q, k, v, is_causal=True)
 
 
-def flash_attention(
-    q: jax.Array,
-    k: jax.Array, 
-    v: jax.Array,
-    causal: bool = False,
-    dropout_p: float = 0.0,
-    softmax_scale: Optional[float] = None,
-    deterministic: bool = True,
-) -> jax.Array:
-    """
-    Flash attention implementation using JAX's dot_product_attention.
-    
-    Args:
-        q: Query tensor of shape [batch, seq_len, num_heads, head_dim]
-        k: Key tensor of shape [batch, seq_len, num_heads, head_dim]
-        v: Value tensor of shape [batch, seq_len, num_heads, head_dim]
-        causal: Whether to apply causal masking
-        dropout_p: Dropout probability (must be 0.0, not supported)
-        softmax_scale: Scaling factor for attention scores (must be None, not supported)
-        deterministic: Whether to use deterministic dropout (ignored)
-        
-    Returns:
-        Attention output of shape [batch, seq_len, num_heads, head_dim]
-    """
-    # Check unsupported arguments (outside of JIT-compiled function)
-    if dropout_p != 0.0:
-        raise ValueError("dropout_p must be 0.0, dropout is not supported in this implementation")
-    
-    if softmax_scale is not None:
-        raise ValueError("softmax_scale must be None, custom scaling is not supported in this implementation")
-    
-    # Use JAX's optimized dot_product_attention
-    if causal:
-        return _attention_causal(q, k, v)
-    else:
-        return _attention_non_causal(q, k, v)
-
-
 def attention(
     q: jax.Array,
     k: jax.Array,
@@ -113,7 +75,8 @@ class WanRMSNorm(nnx.Module):
         Args:
             x: Input tensor of shape [batch, seq_len, dim]
         """
+        orig_dtype = x.dtype
         x = x.astype(jnp.float32)
         x = x * jax.lax.rsqrt(jnp.mean(x**2, axis=-1, keepdims=True) + self.eps)
-        x = x.astype(x.dtype) * self.weight
+        x = x.astype(orig_dtype) * self.weight
         return x
