@@ -1,0 +1,16 @@
+jax>=0.4.20
+jaxlib>=0.4.20
+flax>=0.8.0
+flax-nnx>=0.1.0
+optax>=0.1.7
+chex>=0.1.7
+numpy>=1.23.5,<2
+matplotlib>=3.7.0
+torch>=2.0.0
+torchvision>=0.15.0
+diffusers>=0.31.0
+transformers>=4.49.0
+huggingface_hub>=0.19.0
+Pillow>=9.0.0
+tqdm>=4.65.0
+
