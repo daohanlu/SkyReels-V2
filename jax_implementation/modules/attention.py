@@ -117,34 +117,3 @@ class WanRMSNorm(nnx.Module):
         x = x * jax.lax.rsqrt(jnp.mean(x**2, axis=-1, keepdims=True) + self.eps)
         x = x.astype(x.dtype) * self.weight
         return x
-
-
-class WanLayerNorm(nnx.Module):
-    """Layer normalization layer."""
-    
-    def __init__(self, dim: int, eps: float = 1e-6, elementwise_affine: bool = True):
-        super().__init__()
-        self.dim = dim
-        self.eps = eps
-        self.elementwise_affine = elementwise_affine
-        
-        if elementwise_affine:
-            self.weight = nnx.Param(jnp.ones(dim))
-            self.bias = nnx.Param(jnp.zeros(dim))
-        else:
-            self.weight = None
-            self.bias = None
-    
-    def __call__(self, x: jax.Array) -> jax.Array:
-        """
-        Args:
-            x: Input tensor of shape [batch, seq_len, dim]
-        """
-        mean = jnp.mean(x, axis=-1, keepdims=True)
-        var = jnp.var(x, axis=-1, keepdims=True)
-        x = (x - mean) / jnp.sqrt(var + self.eps)
-        
-        if self.elementwise_affine:
-            x = x * self.weight + self.bias
-            
-        return x

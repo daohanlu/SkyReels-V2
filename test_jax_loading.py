@@ -55,16 +55,16 @@ def test_weight_loading(model_id: str):
         from jax_implementation.utils.weight_converter import load_torch_weights
         
         # Load PyTorch weights and config
-        jax_weights, config = load_torch_weights(model_id)
+        torch_weights, config = load_torch_weights(model_id)
         
-        print(f"✅ Loaded {len(jax_weights)} weights")
+        print(f"✅ Loaded {len(torch_weights)} weights")
         print(f"✅ Config keys: {list(config.keys())}")
         
         # Print some sample weight names
-        sample_weights = list(jax_weights.keys())[:10]
+        sample_weights = list(torch_weights.keys())[:10]
         print(f"✅ Sample weight names: {sample_weights}")
         
-        return jax_weights, config
+        return torch_weights, config
         
     except Exception as e:
         print(f"❌ Weight loading failed: {e}")
@@ -103,13 +103,6 @@ def test_model_creation(config: dict):
         print("✅ JAX model created successfully")
         print(f"✅ Model type: {type(jax_model)}")
         
-        # Try to access state
-        try:
-            state = jax_model.state
-            print(f"✅ Model has {len(state)} parameters in state")
-        except Exception as e:
-            print(f"⚠️ Could not access state: {e}")
-        
         return jax_model
         
     except Exception as e:
@@ -119,7 +112,7 @@ def test_model_creation(config: dict):
         return None
 
 
-def test_weight_application(jax_model, jax_weights):
+def test_weight_application(jax_model, torch_weights):
     """Test applying weights to JAX model."""
     print("🔄 Testing weight application...")
     
@@ -127,7 +120,7 @@ def test_weight_application(jax_model, jax_weights):
         from jax_implementation.utils.weight_converter import apply_weights_to_model
         
         # Apply weights to JAX model
-        jax_model = apply_weights_to_model(jax_model, jax_weights)
+        jax_model = apply_weights_to_model(jax_model, torch_weights)
         
         print("✅ Weights applied successfully")
         return jax_model
@@ -220,8 +213,8 @@ def main():
     print(f"Downloaded model path: {model_id}")
     
     # Test 2: Weight loading
-    jax_weights, config = test_weight_loading(model_id)
-    if jax_weights is None:
+    torch_weights, config = test_weight_loading(model_id)
+    if torch_weights is None:
         print("❌ Weight loading failed, stopping tests")
         return 1
     
@@ -232,7 +225,7 @@ def main():
         return 1
     
     # Test 4: Weight application
-    jax_model = test_weight_application(jax_model, jax_weights)
+    jax_model = test_weight_application(jax_model, torch_weights)
     if jax_model is None:
         print("❌ Weight application failed, stopping tests")
         return 1

@@ -4,8 +4,38 @@ import jax.numpy as jnp
 from jax import lax
 from typing import List, Optional, Tuple, Union
 from flax import nnx
-from .attention import WanRMSNorm, WanLayerNorm, attention
+from .attention import WanRMSNorm, attention
 from .utils import sinusoidal_embedding_1d, rope_params, rope_apply, mul_add, mul_add_add
+
+
+class WanLayerNorm(nnx.LayerNorm):
+    """
+    A wrapper around flax.nnx.LayerNorm that mimics the `elementwise_affine`
+    parameter from the PyTorch nn.LayerNorm API for compatibility.
+    """
+    def __init__(self, num_features: int, eps: float = 1e-6, elementwise_affine: bool = False, rngs: nnx.Rngs = nnx.Rngs(0)):
+        """
+        Initializes the LayerNorm wrapper.
+
+        Args:
+            num_features: The number of num_features in the input.
+            eps: A small float added to variance to avoid dividing by zero.
+            elementwise_affine: If True, this module has learnable affine
+                parameters (scale and bias). Corresponds to `use_scale` and
+                `use_bias` in the parent `nnx.LayerNorm`. Default is False
+                according to the PyTorch model at
+                https://github.com/SkyworkAI/SkyReels-V2/blob/main/skyreels_v2_infer/modules/transformer.py#L104.
+            rngs: The random number generator to use for initialization.
+        """
+        # The `use_scale` and `use_bias` arguments in nnx.LayerNorm directly
+        # correspond to the behavior of `elementwise_affine`.
+        super().__init__(
+            num_features=num_features,
+            epsilon=eps,
+            use_bias=elementwise_affine,
+            use_scale=elementwise_affine,
+            rngs=rngs
+        )
 
 
 class Conv3d(nnx.Module):
@@ -106,10 +136,6 @@ class WanSelfAttention(nnx.Module):
         # Normalization layers
         self.norm_q = WanRMSNorm(dim, eps) if qk_norm else nnx.Identity()
         self.norm_k = WanRMSNorm(dim, eps) if qk_norm else nnx.Identity()
-        
-        # Modulation parameters - use jax.random instead of jnp.random
-        key = jax.random.PRNGKey(42)
-        self.modulation = nnx.Param(jax.random.normal(key, (1, 6, dim)) * (1/math.sqrt(dim)))
     
     def set_ar_attention(self):
         """Set autoregressive attention mode."""
@@ -240,7 +266,7 @@ class WanAttentionBlock(nnx.Module):
         self.eps = eps
         
         # Layers
-        self.norm1 = WanLayerNorm(dim, eps)
+        self.norm1 = WanLayerNorm(dim, eps, rngs=nnx.Rngs(0))
         self.self_attn = WanSelfAttention(dim, num_heads, window_size, qk_norm, eps)
         self.norm3 = WanLayerNorm(dim, eps, elementwise_affine=True) if cross_attn_norm else nnx.Identity()
         
@@ -252,7 +278,7 @@ class WanAttentionBlock(nnx.Module):
         else:
             raise ValueError(f"Unknown cross attention type: {cross_attn_type}")
         
-        self.norm2 = WanLayerNorm(dim, eps)
+        self.norm2 = WanLayerNorm(dim, eps, rngs=nnx.Rngs(0))
         self.ffn_1 = nnx.Linear(dim, ffn_dim, rngs=nnx.Rngs(0))
         self.ffn_2 = nnx.Linear(ffn_dim, dim, rngs=nnx.Rngs(0))
         
@@ -319,7 +345,7 @@ class Head(nnx.Module):
         
         # Layers
         out_dim_total = math.prod(patch_size) * out_dim
-        self.norm = WanLayerNorm(dim, eps)
+        self.norm = WanLayerNorm(dim, eps, rngs=nnx.Rngs(0))
         self.head = nnx.Linear(dim, out_dim_total, rngs=nnx.Rngs(0))
         
         # Modulation - use jax.random instead of jnp.random
@@ -345,21 +371,34 @@ class Head(nnx.Module):
 
 
 class MLPProj(nnx.Module):
-    """MLP projection for image embeddings."""
+    """
+    MLP projection for image embeddings.
+    CORRECTED: This class now uses a standard Python list to hold modules,
+    which nnx correctly nests to match the PyTorch nn.Sequential structure.
+    """
     
     def __init__(self, in_dim: int, out_dim: int):
         super().__init__()
-        self.norm1 = WanLayerNorm(in_dim)
-        self.proj_1 = nnx.Linear(in_dim, in_dim, rngs=nnx.Rngs(0))
-        self.proj_2 = nnx.Linear(in_dim, out_dim, rngs=nnx.Rngs(0))
-        self.norm2 = WanLayerNorm(out_dim)
+        # The PyTorch model defines a Sequential module named 'proj'. We
+        # replicate its structure here using a standard Python list. NNX will
+        # automatically discover the nested modules and create the correct
+        # parameter paths (e.g., 'proj.0.weight', 'proj.1.weight').
+        self.proj = [
+            WanLayerNorm(in_dim, elementwise_affine=True, rngs=nnx.Rngs(0)),      # index 0
+            nnx.Linear(in_dim, in_dim, rngs=nnx.Rngs(0)),     # index 1
+            # nn.GELU is just a function, so it doesn't have parameters and
+            # doesn't need a placeholder in the list.
+            nnx.Linear(in_dim, out_dim, rngs=nnx.Rngs(0)),    # index 3 in PyTorch
+            WanLayerNorm(out_dim, elementwise_affine=True, rngs=nnx.Rngs(0))      # index 4 in PyTorch
+        ]
     
     def __call__(self, image_embeds: jax.Array) -> jax.Array:
-        x = self.norm1(image_embeds)
-        x = self.proj_1(x)
-        x = jax.nn.gelu(x, approximate=True)
-        x = self.proj_2(x)
-        x = self.norm2(x)
+        # Apply the layers sequentially, just like nn.Sequential.
+        x = self.proj[0](image_embeds)
+        x = self.proj[1](x)
+        x = jax.nn.gelu(x, approximate=True) # Apply GELU activation.
+        x = self.proj[2](x) # Corresponds to index 3 in PyTorch
+        x = self.proj[3](x) # Corresponds to index 4 in PyTorch
         return x
 
 
