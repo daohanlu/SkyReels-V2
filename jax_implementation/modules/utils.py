@@ -176,8 +176,12 @@ def mul_add(x: jax.Array, y: jax.Array, z: jax.Array) -> jax.Array:
 
 
 def mul_add_add(x: jax.Array, y: jax.Array, z: jax.Array) -> jax.Array:
-    """Element-wise operation: x * (1 + y) + z"""
+    """Element-wise operation: x * (1 + y) + z
+    
+    Matches PyTorch's implementation: x.float() * (1 + y) + z
+    Note: PyTorch doesn't cast y to float32 before adding 1
+    """
     orig_dtype = x.dtype
-    result = x.astype(jnp.float32) * (1 + y.astype(jnp.float32)) + z.astype(jnp.float32)
+    result = x.astype(jnp.float32) * (1 + y) + z
     return result.astype(orig_dtype)
 

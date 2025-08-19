@@ -341,7 +341,9 @@ class WanAttentionBlock(nnx.Module):
         
         # Cross-attention & FFN
         def cross_attn_ffn(x, context, e):
-            x = x + self.cross_attn(self.norm3(x), context)
+            # Convert x to context dtype (bfloat16) before cross-attention, matching PyTorch
+            x_bf16 = x.astype(context.dtype) if x.dtype != context.dtype else x
+            x = x + self.cross_attn(self.norm3(x_bf16), context)
             y = self.ffn_2(nnx.gelu(self.ffn_1(mul_add_add(self.norm2(x), e[4], e[3]))))
             x = mul_add(x, y, e[5])
             return x
