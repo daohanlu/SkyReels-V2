@@ -11,6 +11,9 @@ import jax.numpy as jnp
 import numpy as np
 from typing import Dict, Any
 
+# Enable float64 in JAX for better precision
+jax.config.update('jax_enable_x64', True)
+
 # Add paths
 sys.path.append('.')
 sys.path.append('./jax_implementation')
@@ -190,7 +193,7 @@ def trace_forward_pass():
         # PyTorch time embedding - uses sinusoidal embedding
         from skyreels_v2_infer.modules.transformer import sinusoidal_embedding_1d as torch_sinusoidal
         t_sin_torch = torch_sinusoidal(config['freq_dim'], t_torch).to(torch.bfloat16)
-        t_sin_jax = sinusoidal_embedding_1d(config['freq_dim'], t_jax.reshape(-1))
+        t_sin_jax = sinusoidal_embedding_1d(config['freq_dim'], t_jax.reshape(-1)).astype(jnp.bfloat16)
         compare_tensors("Sinusoidal embedding", t_sin_torch, t_sin_jax)
         
         # time_embedding: Linear -> SiLU -> Linear

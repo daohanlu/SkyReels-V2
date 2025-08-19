@@ -321,13 +321,18 @@ class WanAttentionBlock(nnx.Module):
         if e.ndim == 3: # Shape is [B, 6, dim]
             modulation = self.modulation
             e = modulation + e
-            # Correctly split 'e' into 6 parts without corrupting the batch dim
-            e = jnp.transpose(e, (1, 0, 2)) # Shape becomes [6, B, dim]
+            # Split along dim=1 to match PyTorch's chunk(6, dim=1)
+            # e has shape [B, 6, dim], split into 6 parts of [B, 1, dim]
+            e_split = jnp.split(e, 6, axis=1)
+            # Squeeze to get [B, dim] for each part
+            e = [jnp.squeeze(ei, axis=1) for ei in e_split]
         elif e.ndim == 4: # Shape is [B, seq_len, 6, dim]
             modulation = self.modulation[:, None, :, :] # Shape becomes [1, 1, 6, dim]
             e = modulation + e
-            # Correctly split 'e'
-            e = jnp.transpose(e, (2, 0, 1, 3)) # Shape becomes [6, B, seq_len, dim]
+            # Split along dim=2 (the 6 dimension)
+            e_split = jnp.split(e, 6, axis=2)
+            # Squeeze to get [B, seq_len, dim] for each part
+            e = [jnp.squeeze(ei, axis=2) for ei in e_split]
         
         # Self-attention
         out = mul_add_add(self.norm1(x), e[1], e[0])

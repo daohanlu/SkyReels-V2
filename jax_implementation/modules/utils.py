@@ -18,16 +18,21 @@ def sinusoidal_embedding_1d(dim: int, position: jax.Array) -> jax.Array:
     assert dim % 2 == 0, "Dimension must be even"
     half = dim // 2
     
-    # Convert to float64 for precision (matches PyTorch)
-    position = position.astype(jnp.float64)
+    # Use float64 if available (requires jax.config.update('jax_enable_x64', True))
+    # Otherwise falls back to float32
+    try:
+        position = position.astype(jnp.float64)
+        dtype = jnp.float64
+    except:
+        position = position.astype(jnp.float32)
+        dtype = jnp.float32
     
-    # Calculate sinusoidal embeddings with float64 precision
-    # Use float64 for the division to match PyTorch's .div(half) behavior
-    freqs = jnp.outer(position, jnp.power(10000.0, -jnp.arange(half, dtype=jnp.float64) / jnp.float64(half)))
+    # Calculate sinusoidal embeddings matching PyTorch's implementation
+    freqs = jnp.outer(position, jnp.power(10000.0, -jnp.arange(half, dtype=dtype) / dtype(half)))
     x = jnp.concatenate([jnp.cos(freqs), jnp.sin(freqs)], axis=1)
     
-    # Return as bfloat16 to match model dtype
-    return x.astype(jnp.bfloat16)
+    # Return in the computed dtype - will be converted to bfloat16 later as needed
+    return x
 
 
 def rope_params(max_seq_len: int, dim: int, theta: float = 10000.0) -> jax.Array:
@@ -57,20 +62,82 @@ def rope_params(max_seq_len: int, dim: int, theta: float = 10000.0) -> jax.Array
 
 def rope_apply(x: jax.Array, grid_sizes: jax.Array, freqs: jax.Array) -> jax.Array:
     """
-    Apply RoPE (Rotary Position Embedding) to input tensor.
-    Simplified version that bypasses complex split logic.
-    
+    Applies 3D Rotary Position Embeddings (RoPE) to the input tensor using JAX.
+
+    This function extends 2D RoPE to 3D for video data by factorizing the
+    embeddings across the frame, height, and width dimensions.
+
     Args:
-        x: Input tensor of shape [batch, seq_len, num_heads, head_dim]
-        grid_sizes: Grid sizes [F, H, W]
-        freqs: RoPE frequency parameters
-        
+        x (jax.Array): The input tensor (e.g., query or key) with a shape of
+                       (batch_size, seq_len, num_heads, head_dim).
+        grid_sizes (jax.Array | tuple): A 1D array or tuple containing the
+                                        grid dimensions (frames, height, width).
+        freqs (jax.Array): A precomputed complex-valued tensor of rotary frequencies
+                           with a shape of (max_len, head_dim // 2).
+
     Returns:
-        Tensor with RoPE applied
+        jax.Array: The tensor with RoPE applied, having the same shape as the input `x`.
     """
-    # For now, return the input unchanged to get the model working
-    # This is a placeholder - in a full implementation, proper RoPE would be applied
-    return x
+    # 1. Get dimensions from the input tensor
+    # 'n' corresponds to num_heads, and 'c' is half of the head_dim
+    bs, seq_len_from_x, n, head_dim = x.shape
+    c = head_dim // 2
+
+    # 2. Split the frequency tensor for each dimension (frame, height, width)
+    # The head dimension is partitioned to handle each spatial/temporal dimension separately.
+    split_proportions = jnp.array([c - 2 * (c // 3), c // 3, c // 3])
+    split_indices = jnp.cumsum(split_proportions)[:-1]
+    freqs_f, freqs_h, freqs_w = jnp.split(freqs, split_indices, axis=1)
+
+    # 3. Unpack grid dimensions and calculate the total sequence length
+    f, h, w = grid_sizes
+    seq_len = f * h * w
+    # Ensure the input tensor's sequence length matches the grid product
+    if seq_len_from_x != seq_len:
+        raise ValueError(
+            f"Input sequence length {seq_len_from_x} must match the product of grid_sizes {seq_len}."
+        )
+
+    # 4. Reshape the input to view pairs of values as complex numbers
+    # Shape: (bs, seq_len, n, head_dim) -> (bs, seq_len, n, c, 2)
+    x_reshaped = x.astype(jnp.float32).reshape(bs, seq_len, n, c, 2)
+    # Shape: (bs, seq_len, n, c, 2) -> (bs, seq_len, n, c) [complex]
+    x_complex = jax.lax.complex(x_reshaped[..., 0], x_reshaped[..., 1])
+
+    # 5. Construct the 3D rotary embedding tensor
+    # Slice the frequencies to match the actual grid dimensions
+    freqs_f = freqs_f[:f]
+    freqs_h = freqs_h[:h]
+    freqs_w = freqs_w[:w]
+
+    # Reshape and broadcast each frequency component to the full (f, h, w, c_part) grid.
+    # This creates a unique rotary angle for each token's position.
+    freqs_f_grid = jnp.broadcast_to(freqs_f.reshape(f, 1, 1, -1), (f, h, w, freqs_f.shape[-1]))
+    freqs_h_grid = jnp.broadcast_to(freqs_h.reshape(1, h, 1, -1), (f, h, w, freqs_h.shape[-1]))
+    freqs_w_grid = jnp.broadcast_to(freqs_w.reshape(1, 1, w, -1), (f, h, w, freqs_w.shape[-1]))
+
+    # Concatenate along the last dimension to form the complete embedding
+    freqs_3d = jnp.concatenate([freqs_f_grid, freqs_h_grid, freqs_w_grid], axis=-1)
+    
+    # Reshape to be broadcastable with the input tensor
+    freqs_i = freqs_3d.reshape(seq_len, 1, c)
+
+    # 6. Apply rotary embeddings via element-wise complex multiplication
+    # JAX's broadcasting rules handle the shape alignment:
+    # x_complex shape: (bs, seq_len, n, c)
+    # freqs_i shape:        (seq_len, 1, c) -> broadcasted to (1, seq_len, n, c)
+    rotated_x_complex = x_complex * freqs_i
+
+    # 7. Convert the complex tensor back to its real representation
+    # Shape: (bs, seq_len, n, c) [complex] -> (bs, seq_len, n, c, 2)
+    rotated_x_real_parts = jnp.stack([rotated_x_complex.real, rotated_x_complex.imag], axis=-1)
+    
+    # Flatten the last two dimensions to restore the original head_dim
+    # Shape: (bs, seq_len, n, c, 2) -> (bs, seq_len, n, head_dim)
+    output = rotated_x_real_parts.reshape(bs, seq_len, n, head_dim)
+    
+    # Preserve original dtype
+    return output.astype(x.dtype)
 
 
 def apply_rope_1d(x: jax.Array, freq: jax.Array) -> jax.Array:
