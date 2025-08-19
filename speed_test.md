@@ -65,6 +65,16 @@ This document summarizes comprehensive performance testing of JAX vs PyTorch imp
 | **JAX (Standard, With JIT)** | 26.41s | 2.24s* | *After compilation |
 | **JAX (Memory-Efficient)** | 27.46s | 5.09s | Nearly same as standard |
 
+### 13 Frames Generation (5 inference steps) - JIT Comparison
+
+| Implementation | Total Time | Denoising | Compilation Overhead | Per Step (after) |
+|----------------|------------|-----------|---------------------|------------------|
+| **JAX (Standard + JIT)** | 34.34s | 30.58s | 19.91s | ~2.03s |
+| **JAX (Memory-Efficient + JIT)** | 29.62s | 25.84s | 14.96s | ~2.18s |
+| **Performance Delta** | **-14% faster** | **-15% faster** | **-25% faster** | +7% slower |
+
+**Surprising Finding**: Memory-efficient attention is actually **14% faster overall** than standard attention at 13 frames with JIT compilation, despite slightly slower per-step performance after compilation. The speedup comes from **30% faster XLA compilation** of the chunked attention pattern compared to full attention matrices.
+
 ## JIT Compilation Analysis
 
 ### XLA Compilation Overhead (First Run)
@@ -91,7 +101,10 @@ This document summarizes comprehensive performance testing of JAX vs PyTorch imp
 - **File**: `jax_implementation/modules/attention_memory_efficient.py`
 - **Method**: Chunked attention processing (256 token chunks)
 - **Impact**: Enables 57+ frame generation on 48GB GPU
-- **Overhead**: Negligible (~2% slower than standard for small sequences)
+- **Performance**: 
+  - Small sequences (9 frames): ~2% slower without JIT
+  - Medium sequences (13 frames): **14% faster with JIT** due to better compilation
+  - Large sequences (57 frames): Enables generation where standard attention OOMs
 
 ### 2. XLA Memory Configuration
 ```bash
