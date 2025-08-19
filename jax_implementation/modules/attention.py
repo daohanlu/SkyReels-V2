@@ -3,6 +3,12 @@ import jax.numpy as jnp
 from typing import Optional, Tuple
 from flax import nnx
 from functools import partial
+import os
+
+# Import memory-efficient attention if enabled
+USE_MEMORY_EFFICIENT_ATTENTION = os.environ.get("JAX_MEMORY_EFFICIENT_ATTENTION", "true").lower() == "true"
+if USE_MEMORY_EFFICIENT_ATTENTION:
+    from .attention_memory_efficient import memory_efficient_attention
 
 
 @partial(jax.jit, static_argnames=['is_causal'])
@@ -46,7 +52,7 @@ def attention(
     deterministic: bool = True,
 ) -> jax.Array:
     """
-    Standard attention implementation using JAX's dot_product_attention.
+    Attention implementation with optional memory-efficient mode.
     
     Args:
         q: Query tensor of shape [batch, seq_len, num_heads, head_dim]
@@ -60,6 +66,15 @@ def attention(
     Returns:
         Attention output of shape [batch, seq_len, num_heads, head_dim]
     """
+    # Use memory-efficient attention if enabled
+    if USE_MEMORY_EFFICIENT_ATTENTION:
+        return memory_efficient_attention(
+            q, k, v, causal=causal, dropout_p=dropout_p,
+            softmax_scale=softmax_scale, deterministic=deterministic,
+            use_flash=False, chunk_size=256  # Use chunked attention with smaller chunks
+        )
+    
+    # Otherwise use standard implementation
     # Check unsupported arguments (outside of JIT-compiled function)
     if dropout_p != 0.0:
         raise ValueError("dropout_p must be 0.0, dropout is not supported in this implementation")

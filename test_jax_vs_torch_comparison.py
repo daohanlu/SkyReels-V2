@@ -94,13 +94,18 @@ def run_torch_generation(args):
 def run_jax_generation(args):
     """Run JAX generation with custom pipeline."""
     print("\n" + "="*60)
-    print("🚀 Running JAX Generation")
+    print("🚀 Running JAX Generation (Optimized)")
     print("="*60)
+    
+    # Set memory optimization
+    import os
+    os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.80"
+    os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
     
     # Import JAX components here to avoid early memory allocation
     from jax_implementation.modules import WanModel
     from jax_implementation.utils.weight_converter import load_torch_weights, apply_weights_to_model
-    from test_jax_generation import JAXImage2VideoPipeline
+    from test_jax_generation_optimized import JAXImage2VideoPipelineOptimized as JAXImage2VideoPipeline
     
     # Load image
     image = load_image(args.image).convert("RGB")
