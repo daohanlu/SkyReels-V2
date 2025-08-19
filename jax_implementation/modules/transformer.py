@@ -463,9 +463,9 @@ class WanModel(nnx.Module):
         self.enable_teacache = False
         
         # Embeddings
-        # For i2v mode, we need to handle concatenated input (x + y = 2 * in_dim channels)
-        patch_input_dim = in_dim * 2 if model_type == "i2v" else in_dim
-        self.patch_embedding = Conv3d(patch_input_dim, dim, kernel_size=patch_size, strides=patch_size)
+        # For i2v mode, PyTorch config already includes concatenated channels (36 = 16 + 20)
+        # So we use in_dim directly which should already be the total channels
+        self.patch_embedding = Conv3d(in_dim, dim, kernel_size=patch_size, strides=patch_size)
         
         # Text embedding layers
         self.text_embedding_1 = nnx.Linear(text_dim, dim, rngs=nnx.Rngs(0))

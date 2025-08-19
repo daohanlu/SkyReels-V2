@@ -83,21 +83,48 @@ def apply_weights_to_model(model: WanModel, pt_state_dict: Dict[str, Any]) -> Wa
     print("Starting weight conversion and application...")
 
     # --- Helper functions for clarity ---
-    def conv_linear(pt_key_weight: str, pt_key_bias: str):
+    def conv_linear(pt_key_weight: str, pt_key_bias: str, dtype=jnp.bfloat16):
         """Converts a PyTorch linear layer's weights and biases."""
-        w = jnp.asarray(pt_state_dict[pt_key_weight]).T
-        b = jnp.asarray(pt_state_dict[pt_key_bias])
+        w = jnp.asarray(pt_state_dict[pt_key_weight], dtype=dtype).T
+        b = jnp.asarray(pt_state_dict[pt_key_bias], dtype=dtype)
         return w, b
 
-    def conv_param(pt_key: str):
+    def conv_param(pt_key: str, dtype=jnp.bfloat16):
         """Converts a generic PyTorch parameter."""
-        return jnp.asarray(pt_state_dict[pt_key])
+        return jnp.asarray(pt_state_dict[pt_key], dtype=dtype)
+    
+    def assert_layernorm(jax_ln_layer, pt_prefix: str):
+        """Asserts that a JAX LayerNorm's params match the PyTorch state dict."""
+        pt_weight_key = f"{pt_prefix}.weight"
+        pt_bias_key = f"{pt_prefix}.bias"
+        
+        has_pt_weight = pt_weight_key in pt_state_dict
+        has_pt_bias = pt_bias_key in pt_state_dict
+        
+        # If PyTorch has affine params, JAX layer must have scale and bias
+        if has_pt_weight or has_pt_bias:
+            assert hasattr(jax_ln_layer, 'scale') and jax_ln_layer.scale is not None, \
+                f"JAX LayerNorm for '{pt_prefix}' is missing 'scale' parameter."
+            assert hasattr(jax_ln_layer, 'bias') and jax_ln_layer.bias is not None, \
+                f"JAX LayerNorm for '{pt_prefix}' is missing 'bias' parameter."
+            
+            # Check shapes
+            pt_weight_shape = pt_state_dict[pt_weight_key].shape
+            jax_scale_shape = jax_ln_layer.scale.value.shape
+            assert pt_weight_shape == jax_scale_shape, \
+                f"Shape mismatch for '{pt_prefix}': PT weight {pt_weight_shape} vs JAX scale {jax_scale_shape}"
+
+            pt_bias_shape = pt_state_dict[pt_bias_key].shape
+            jax_bias_shape = jax_ln_layer.bias.value.shape
+            assert pt_bias_shape == jax_bias_shape, \
+                f"Shape mismatch for '{pt_prefix}': PT bias {pt_bias_shape} vs JAX bias {jax_bias_shape}"
 
     # --- Top-level parameters ---
     print("Loading top-level embeddings and projections...")
     pt_w = pt_state_dict['patch_embedding.weight']
-    model.patch_embedding.kernel.value = jnp.asarray(pt_w).transpose(2, 3, 4, 1, 0)
-    model.patch_embedding.bias.value = conv_param('patch_embedding.bias')
+    # Convert to bfloat16 to match PyTorch model's dtype
+    model.patch_embedding.kernel.value = jnp.asarray(pt_w, dtype=jnp.bfloat16).transpose(2, 3, 4, 1, 0)
+    model.patch_embedding.bias.value = jnp.asarray(pt_state_dict['patch_embedding.bias'], dtype=jnp.bfloat16)
 
     # Text Embeddings (from nn.Sequential)
     model.text_embedding_1.kernel.value, model.text_embedding_1.bias.value = conv_linear('text_embedding.0.weight', 'text_embedding.0.bias')
@@ -118,10 +145,12 @@ def apply_weights_to_model(model: WanModel, pt_state_dict: Dict[str, Any]) -> Wa
     # Image embedding projection (for i2v model)
     if model.model_type == 'i2v':
         print("Loading image embedding projection for i2v model...")
+        assert_layernorm(model.img_emb.proj[0], 'img_emb.proj.0')
         model.img_emb.proj[0].scale.value = conv_param('img_emb.proj.0.weight')
         model.img_emb.proj[0].bias.value = conv_param('img_emb.proj.0.bias')
         model.img_emb.proj[1].kernel.value, model.img_emb.proj[1].bias.value = conv_linear('img_emb.proj.1.weight', 'img_emb.proj.1.bias')
-        model.img_emb.proj[2].kernel.value, model.img_emb.proj[2].bias.value = conv_linear('img_emb.proj.3.weight', 'img_emb.proj.3.bias')
+        model.img_emb.proj[2].kernel.value, model.img_emb.proj[2].bias.value = conv_linear('img_emb.proj.3.weight', 'img_emb.proj.3.bias')        
+        assert_layernorm(model.img_emb.proj[3], 'img_emb.proj.4')
         model.img_emb.proj[3].scale.value = conv_param('img_emb.proj.4.weight')
         model.img_emb.proj[3].bias.value = conv_param('img_emb.proj.4.bias')
 
@@ -135,6 +164,7 @@ def apply_weights_to_model(model: WanModel, pt_state_dict: Dict[str, Any]) -> Wa
 
         # Normalization layers
         if model.cross_attn_norm:
+            assert_layernorm(block.norm3, f'{prefix}norm3')
             block.norm3.scale.value = conv_param(f'{prefix}norm3.weight')
             block.norm3.bias.value = conv_param(f'{prefix}norm3.bias')
 
@@ -196,7 +226,7 @@ if __name__ == '__main__':
             model_type=config.get('model_type', 'i2v'),
             patch_size=tuple(config.get('patch_size', [1, 2, 2])),
             text_len=config.get('text_len', 512),
-            in_dim=config.get('in_dim', 36),
+            in_dim=config.get('in_dim', 36),  # For i2v this is already the concatenated dim
             dim=config.get('dim', 1536),  # 1.3B model uses 1536
             ffn_dim=config.get('ffn_dim', 8960),  # 1.3B model uses 8960
             freq_dim=config.get('freq_dim', 256),

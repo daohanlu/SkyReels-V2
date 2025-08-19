@@ -115,11 +115,13 @@ def trace_forward_pass():
     # Load JAX model
     print("Loading JAX model...")
     jax_weights, config = load_torch_weights(model_path)
+    
+    # Use config values directly - PyTorch i2v config has in_dim=36 (concatenated)
     jax_model = WanModel(
-        model_type='i2v',
+        model_type=config.get('model_type', 'i2v'),
         patch_size=tuple(config.get('patch_size', [1, 2, 2])),
         text_len=config.get('text_len', 512),
-        in_dim=config.get('in_dim', 16),
+        in_dim=config.get('in_dim', 36),  # Use the actual config value
         dim=config.get('dim', 1536),
         ffn_dim=config.get('ffn_dim', 8960),
         freq_dim=config.get('freq_dim', 256),
@@ -150,10 +152,10 @@ def trace_forward_pass():
     print("STAGE 1: INPUT CONCATENATION")
     print("=" * 60)
     
-    # Concatenate x and y
+    # Concatenate x and y - convert to bfloat16 to match model dtype
     with torch.no_grad():
-        x_cat_torch = torch.cat([x_torch, y_torch], dim=1)
-    x_cat_jax = jnp.concatenate([x_jax, y_jax], axis=1)
+        x_cat_torch = torch.cat([x_torch, y_torch], dim=1).to(torch.bfloat16)
+    x_cat_jax = jnp.concatenate([x_jax, y_jax], axis=1).astype(jnp.bfloat16)
     
     compare_tensors("Concatenated input (x + y)", x_cat_torch, x_cat_jax)
     
@@ -161,10 +163,9 @@ def trace_forward_pass():
     print("STAGE 2: PATCH EMBEDDING")
     print("=" * 60)
     
-    # Patch embedding - convert to bfloat16 for PyTorch
+    # Patch embedding - already in bfloat16
     with torch.no_grad():
-        x_cat_torch_bf16 = x_cat_torch.to(torch.bfloat16)
-        x_patch_torch = torch_model.patch_embedding(x_cat_torch_bf16)
+        x_patch_torch = torch_model.patch_embedding(x_cat_torch)
     x_patch_jax = jax_model.patch_embedding(x_cat_jax)
     
     compare_tensors("After patch embedding", x_patch_torch, x_patch_jax)

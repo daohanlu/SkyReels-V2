@@ -18,14 +18,16 @@ def sinusoidal_embedding_1d(dim: int, position: jax.Array) -> jax.Array:
     assert dim % 2 == 0, "Dimension must be even"
     half = dim // 2
     
-    # Convert to float64 for precision
+    # Convert to float64 for precision (matches PyTorch)
     position = position.astype(jnp.float64)
     
-    # Calculate sinusoidal embeddings
-    freqs = jnp.outer(position, jnp.power(10000.0, -jnp.arange(half) / half))
+    # Calculate sinusoidal embeddings with float64 precision
+    # Use float64 for the division to match PyTorch's .div(half) behavior
+    freqs = jnp.outer(position, jnp.power(10000.0, -jnp.arange(half, dtype=jnp.float64) / jnp.float64(half)))
     x = jnp.concatenate([jnp.cos(freqs), jnp.sin(freqs)], axis=1)
     
-    return x
+    # Return as bfloat16 to match model dtype
+    return x.astype(jnp.bfloat16)
 
 
 def rope_params(max_seq_len: int, dim: int, theta: float = 10000.0) -> jax.Array:

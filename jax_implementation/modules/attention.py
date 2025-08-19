@@ -8,7 +8,20 @@ from functools import partial
 @partial(jax.jit, static_argnames=['is_causal'])
 def attention_wrapper(query, key, value, is_causal):
     """JIT-compiled wrapper for JAX's dot_product_attention."""
-    return jax.nn.dot_product_attention(query, key, value, is_causal=is_causal)
+    # JAX's dot_product_attention requires float32, so convert if needed
+    orig_dtype = query.dtype
+    if orig_dtype == jnp.bfloat16:
+        query = query.astype(jnp.float32)
+        key = key.astype(jnp.float32)
+        value = value.astype(jnp.float32)
+    
+    result = jax.nn.dot_product_attention(query, key, value, is_causal=is_causal)
+    
+    # Convert back to original dtype
+    if orig_dtype == jnp.bfloat16:
+        result = result.astype(jnp.bfloat16)
+    
+    return result
 
 
 @jax.jit
