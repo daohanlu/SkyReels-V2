@@ -2,6 +2,7 @@
 """
 Test JAX diffusion model implementation with actual generation.
 Modified from generate_video.py to use JAX transformer instead of PyTorch.
+Includes a JIT-compiled option for the denoising loop.
 """
 
 import argparse
@@ -9,6 +10,8 @@ import gc
 import os
 import sys
 import time
+from functools import partial
+
 import torch
 import jax
 import jax.numpy as jnp
@@ -34,16 +37,17 @@ from jax_implementation.utils.weight_converter import load_torch_weights, apply_
 
 class JAXImage2VideoPipeline:
     """
-    Modified Image2VideoPipeline that uses JAX transformer instead of PyTorch.
+    Modified Image2VideoPipeline that uses a JAX transformer with an optional JIT-compiled denoising step.
     """
     
-    def __init__(self, model_path: str, dit_path: str, use_usp: bool = False, offload: bool = False):
+    def __init__(self, model_path: str, dit_path: str, use_usp: bool = False, offload: bool = False, jit: bool = False):
         """Initialize pipeline with JAX transformer."""
         self.model_path = model_path
         self.dit_path = dit_path
         self.use_usp = use_usp
         self.offload = offload
         self.device = "cuda"
+        self.jit = jit
         
         # Load PyTorch components (VAE, text encoder, CLIP)
         load_device = "cpu" if offload else self.device
@@ -80,40 +84,53 @@ class JAXImage2VideoPipeline:
         )
         
         self.transformer = apply_weights_to_model(self.transformer, torch_weights)
+        self.transformer.dtype = jnp.bfloat16 # Use JAX bfloat16
         
-        # Set dtype to match PyTorch transformer
-        self.transformer.dtype = torch.bfloat16
+        if self.jit:
+            print("🚀 Compiling JIT function for denoising step...")
+            # Note: 'guidance_scale' must be static for JIT compilation.
+            self.predict_step_jit = jax.jit(self._predict_step, static_argnames=('guidance_scale',))
         
         print("✅ JAX transformer loaded and weights applied")
-    
-    def run_jax_transformer(self, latents, timestep, context, clip_fea, y):
-        """Run JAX transformer and return PyTorch tensor."""
-        # Convert to JAX arrays preserving dtypes
-        # For bfloat16, we need to handle it specially since numpy doesn't support it
-        def to_jax(tensor):
-            if tensor.dtype == torch.bfloat16:
-                # Convert bfloat16 to float32 numpy, then to jax bfloat16
-                return jnp.array(tensor.cpu().to(torch.float32).numpy(), dtype=jnp.bfloat16)
-            else:
-                return jnp.array(tensor.cpu().numpy())
-        
-        latents_jax = to_jax(latents)
-        timestep_jax = jnp.array([timestep.item() if hasattr(timestep, 'item') else timestep])
-        context_jax = to_jax(context)
-        clip_fea_jax = to_jax(clip_fea) if clip_fea is not None else None
-        y_jax = to_jax(y) if y is not None else None
-        
-        # Run JAX model
-        output = self.transformer(latents_jax, timestep_jax, context_jax, clip_fea_jax, y_jax)
-        
-        # Convert back to PyTorch preserving dtype
-        if output.dtype == jnp.bfloat16:
-            # Convert jax bfloat16 to float32 numpy, then to torch bfloat16
-            output_np = np.array(output, dtype=np.float32)
-            return torch.from_numpy(output_np).to(self.device).to(torch.bfloat16)
+
+    @staticmethod
+    def _to_jax(tensor: torch.Tensor) -> jax.Array:
+        """Converts a PyTorch tensor to a JAX array, handling bfloat16."""
+        if tensor is None:
+            return None
+        if tensor.dtype == torch.bfloat16:
+            # Convert bfloat16 to float32 numpy, then to jax bfloat16
+            return jnp.array(tensor.cpu().to(torch.float32).numpy(), dtype=jnp.bfloat16)
         else:
-            return torch.from_numpy(np.array(output)).to(self.device)
-    
+            return jnp.array(tensor.cpu().numpy())
+
+    def _from_jax(self, array: jax.Array, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
+        """Converts a JAX array back to a PyTorch tensor, handling bfloat16."""
+        if array is None:
+            return None
+        if array.dtype == jnp.bfloat16:
+            # Convert jax bfloat16 to float32 numpy, then to torch bfloat16
+            output_np = np.array(array, dtype=np.float32)
+            return torch.from_numpy(output_np).to(self.device).to(dtype)
+        else:
+            return torch.from_numpy(np.array(array)).to(self.device)
+
+    def _predict_step(self, latent_model_input, t, arg_c, arg_null, guidance_scale):
+        """
+        JAX-based function for a single denoising prediction step.
+        This function is intended to be JIT-compiled.
+        """
+        # Run JAX transformer for conditional and unconditional
+        noise_pred_cond = self.transformer(
+            latent_model_input, t, arg_c['context'], arg_c['clip_fea'], arg_c['y']
+        )
+        noise_pred_uncond = self.transformer(
+            latent_model_input, t, arg_null['context'], arg_null['clip_fea'], arg_null['y']
+        )
+        # Classifier-free guidance
+        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
+        return noise_pred
+
     def __call__(
         self,
         prompt: str,
@@ -128,16 +145,9 @@ class JAXImage2VideoPipeline:
         generator: torch.Generator = None,
     ):
         """Generate video (matching Image2VideoPipeline interface)."""
-        # Calculate latent dimensions (matching original pipeline)
-        latent_height = height // 8 // 2 * 2
-        latent_width = width // 8 // 2 * 2  
+        latent_height, latent_width = height // 8, width // 8
         latent_length = (num_frames - 1) // 4 + 1
-        
-        # Calculate actual processing dimensions
-        h = latent_height * 8
-        w = latent_width * 8
-        
-        # Resize image to processing dimensions
+        h, w = latent_height * 8, latent_width * 8
         image_resized = image.resize((w, h))
         
         # Encode image with VAE
@@ -190,50 +200,69 @@ class JAXImage2VideoPipeline:
         with torch.cuda.amp.autocast(dtype=torch.bfloat16), torch.no_grad():
             self.scheduler.set_timesteps(num_inference_steps, device=self.device, shift=shift)
             timesteps = self.scheduler.timesteps
-            
-            arg_c = {
-                "context": context,
-                "clip_fea": clip_context,
-                "y": y,
-            }
-            
-            arg_null = {
-                "context": context_null,
-                "clip_fea": clip_context,
-                "y": y,
-            }
-            
-            for _, t in enumerate(tqdm(timesteps, desc="Denoising")):
-                latent_model_input = torch.stack([latent]).to(self.device)
+
+            if self.jit:
+                # --- JIT-COMPILED DENOISING LOOP ---
+                print("⚡ Running JIT-compiled denoising loop...")
+                arg_c = {"context": context, "clip_fea": clip_context, "y": y}
+                arg_null = {"context": context_null, "clip_fea": clip_context, "y": y}
                 
-                # Run JAX transformer for conditional and unconditional
-                noise_pred_cond = self.run_jax_transformer(
-                    latent_model_input, t, **arg_c
-                ).to(self.device)
+                # Convert all conditioning tensors to JAX arrays ONCE before the loop
+                arg_c_jax = jax.tree_util.tree_map(self._to_jax, arg_c)
+                arg_null_jax = jax.tree_util.tree_map(self._to_jax, arg_null)
                 
-                noise_pred_uncond = self.run_jax_transformer(
-                    latent_model_input, t, **arg_null
-                ).to(self.device)
+                for _, t in enumerate(tqdm(timesteps, desc="Denoising (JIT)")):
+                    latent_model_input = torch.stack([latent]).to(self.device)
+                    
+                    # Convert only the changing latent tensor inside the loop
+                    latent_model_input_jax = self._to_jax(latent_model_input)
+                    t_jax = jnp.array([t.item() if hasattr(t, 'item') else t])
+
+                    # Call the single compiled JAX function
+                    noise_pred_jax = self.predict_step_jit(
+                        latent_model_input_jax, t_jax, arg_c_jax, arg_null_jax, guidance_scale=guidance_scale
+                    )
+
+                    # Convert result back to PyTorch
+                    noise_pred = self._from_jax(noise_pred_jax, dtype=torch.bfloat16)
+                    
+                    if noise_pred.dim() == 5 and noise_pred.shape[0] == 1:
+                        noise_pred = noise_pred.squeeze(0)
+                    
+                    latent = self.scheduler.step(noise_pred.unsqueeze(0), t, latent.unsqueeze(0), return_dict=False)[0].squeeze(0)
+
+            else:
+                # --- STANDARD (EAGER) DENOISING LOOP ---
+                print("🐌 Running standard (eager) denoising loop...")
+                arg_c = {"context": context, "clip_fea": clip_context, "y": y}
+                arg_null = {"context": context_null, "clip_fea": clip_context, "y": y}
                 
-                # Classifier-free guidance
-                noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
-                
-                # The noise_pred from JAX is shape [1, C, F, H, W], we need [C, F, H, W]
-                if noise_pred.dim() == 5 and noise_pred.shape[0] == 1:
-                    noise_pred = noise_pred.squeeze(0)
-                
-                # Scheduler step
-                temp_x0 = self.scheduler.step(
-                    noise_pred.unsqueeze(0), t, latent.unsqueeze(0), 
-                    return_dict=False, generator=generator
-                )[0]
-                latent = temp_x0.squeeze(0)
-            
-            # Decode with VAE
+                for _, t in enumerate(tqdm(timesteps, desc="Denoising (Eager)")):
+                    latent_model_input = torch.stack([latent]).to(self.device)
+                    
+                    # Manual conversion and execution for conditional pass
+                    noise_pred_cond = self._from_jax(
+                        self.transformer(self._to_jax(latent_model_input), jnp.array([t.item()]), 
+                                         self._to_jax(arg_c['context']), self._to_jax(arg_c['clip_fea']), self._to_jax(arg_c['y']))
+                    )
+                    
+                    # Manual conversion and execution for unconditional pass
+                    noise_pred_uncond = self._from_jax(
+                        self.transformer(self._to_jax(latent_model_input), jnp.array([t.item()]), 
+                                         self._to_jax(arg_null['context']), self._to_jax(arg_null['clip_fea']), self._to_jax(arg_null['y']))
+                    )
+                    
+                    noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
+                    
+                    if noise_pred.dim() == 5 and noise_pred.shape[0] == 1:
+                        noise_pred = noise_pred.squeeze(0)
+
+                    latent = self.scheduler.step(noise_pred.unsqueeze(0), t, latent.unsqueeze(0), return_dict=False)[0].squeeze(0)
+
+            # --- VAE Decoding ---
             self.vae.to(self.device)
             videos = self.vae.decode(latent)
             videos = (videos / 2 + 0.5).clamp(0, 1)
-            videos = [video for video in videos]
             videos = [video.permute(1, 2, 3, 0) * 255 for video in videos]
             videos = [video.cpu().numpy().astype(np.uint8) for video in videos]
         
@@ -253,6 +282,7 @@ def main():
     parser.add_argument("--offload", action="store_true")
     parser.add_argument("--fps", type=int, default=24)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--jit", action="store_true", help="Enable JIT compilation for the denoising loop.")
     parser.add_argument(
         "--prompt",
         type=str,
@@ -261,21 +291,11 @@ def main():
     
     args = parser.parse_args()
     
-    # Download model
     args.model_id = download_model(args.model_id)
     print("model_id:", args.model_id)
     
-    # Set resolution
-    if args.resolution == "540P":
-        height = 544
-        width = 960
-    elif args.resolution == "720P":
-        height = 720
-        width = 1280
-    else:
-        raise ValueError(f"Invalid resolution: {args.resolution}")
+    height, width = (544, 960) if args.resolution == "540P" else (720, 1280)
     
-    # Load and preprocess image
     image = load_image(args.image).convert("RGB")
     image_width, image_height = image.size
     if image_height > image_width:
@@ -288,7 +308,8 @@ def main():
         model_path=args.model_id, 
         dit_path=args.model_id, 
         use_usp=False, 
-        offload=args.offload
+        offload=args.offload,
+        jit=args.jit
     )
     
     # Set up generation parameters
@@ -321,7 +342,7 @@ def main():
     
     # Save video
     current_time = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
-    video_out_file = f"jax_{args.prompt[:50].replace('/','')}_{args.seed}_{current_time}.mp4"
+    video_out_file = f"jax_{'jit' if args.jit else 'eager'}_{args.prompt[:40].replace(' ','_')}_{args.seed}_{current_time}.mp4"
     output_path = os.path.join(save_dir, video_out_file)
     imageio.mimwrite(output_path, video_frames, fps=args.fps, quality=8, output_params=["-loglevel", "error"])
     

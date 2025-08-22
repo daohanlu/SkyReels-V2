@@ -153,14 +153,14 @@ class WanSelfAttention(nnx.Module):
     def __call__(
         self, 
         x: jax.Array, 
-        grid_sizes: jax.Array, 
+        grid_sizes: Tuple[int, int, int], 
         freqs: jax.Array, 
         block_mask: Optional[jax.Array] = None
     ) -> jax.Array:
         """
         Args:
             x: Input tensor of shape [batch, seq_len, dim]
-            grid_sizes: Grid sizes [F, H, W]
+            grid_sizes: Static grid sizes (F, H, W) for RoPE.
             freqs: RoPE frequency parameters
             block_mask: Optional attention mask
         """
@@ -303,7 +303,7 @@ class WanAttentionBlock(nnx.Module):
         self,
         x: jax.Array,
         e: jax.Array,
-        grid_sizes: jax.Array,
+        grid_sizes: Tuple[int, int, int],
         freqs: jax.Array,
         context: jax.Array,
         block_mask: Optional[jax.Array] = None,
@@ -312,27 +312,33 @@ class WanAttentionBlock(nnx.Module):
         Args:
             x: Input tensor of shape [batch, seq_len, dim]
             e: Time embeddings of shape [batch, 6, dim] or [batch, seq_len, 6, dim]
-            grid_sizes: Grid sizes [F, H, W]
+            grid_sizes: Static grid sizes (F, H, W) for RoPE.
             freqs: RoPE frequency parameters
             context: Context tensor for cross-attention
             block_mask: Optional attention mask
         """
-        # Handle modulation
+        # Handle modulation - use float32 precision like PyTorch autocast
         if e.ndim == 3: # Shape is [B, 6, dim]
             modulation = self.modulation
-            e = modulation + e
+            # Perform modulation arithmetic in float32 to match PyTorch autocast
+            e_f32 = e.astype(jnp.float32)
+            modulation_f32 = modulation.astype(jnp.float32)
+            e_result = modulation_f32 + e_f32
             # Split along dim=1 to match PyTorch's chunk(6, dim=1)
             # e has shape [B, 6, dim], split into 6 parts of [B, 1, dim]
-            e_split = jnp.split(e, 6, axis=1)
-            # Squeeze to get [B, dim] for each part
-            e = [jnp.squeeze(ei, axis=1) for ei in e_split]
+            e_split = jnp.split(e_result, 6, axis=1)
+            # Squeeze to get [B, dim] for each part, convert back to original dtype
+            e = [jnp.squeeze(ei, axis=1).astype(e.dtype) for ei in e_split]
         elif e.ndim == 4: # Shape is [B, seq_len, 6, dim]
             modulation = self.modulation[:, None, :, :] # Shape becomes [1, 1, 6, dim]
-            e = modulation + e
+            # Perform modulation arithmetic in float32 to match PyTorch autocast
+            e_f32 = e.astype(jnp.float32)
+            modulation_f32 = modulation.astype(jnp.float32)
+            e_result = modulation_f32 + e_f32
             # Split along dim=2 (the 6 dimension)
-            e_split = jnp.split(e, 6, axis=2)
-            # Squeeze to get [B, seq_len, dim] for each part
-            e = [jnp.squeeze(ei, axis=2) for ei in e_split]
+            e_split = jnp.split(e_result, 6, axis=2)
+            # Squeeze to get [B, seq_len, dim] for each part, convert back to original dtype
+            e = [jnp.squeeze(ei, axis=2).astype(e.dtype) for ei in e_split]
         
         # Self-attention
         out = mul_add_add(self.norm1(x), e[1], e[0])
@@ -344,7 +350,7 @@ class WanAttentionBlock(nnx.Module):
             # Convert x to context dtype (bfloat16) before cross-attention, matching PyTorch
             x_bf16 = x.astype(context.dtype) if x.dtype != context.dtype else x
             x = x + self.cross_attn(self.norm3(x_bf16), context)
-            y = self.ffn_2(nnx.gelu(self.ffn_1(mul_add_add(self.norm2(x), e[4], e[3]))))
+            y = self.ffn_2(jax.nn.gelu(self.ffn_1(mul_add_add(self.norm2(x), e[4], e[3])), approximate=True))
             x = mul_add(x, y, e[5])
             return x
         
@@ -377,16 +383,27 @@ class Head(nnx.Module):
             x: Input tensor of shape [batch, seq_len, dim]
             e: Time embeddings of shape [batch, dim] or [batch, seq_len, dim]
         """
+        # Perform modulation arithmetic in float32 to match PyTorch autocast
+        orig_dtype = x.dtype
         if e.ndim == 2:
-            modulation = self.modulation  # [1, 2, dim]
-            e = (modulation + e[None, :, :]).reshape(2, -1)
+            modulation = self.modulation.astype(jnp.float32)  # [1, 2, dim]
+            e_f32 = e.astype(jnp.float32)
+            e_result = (modulation + e_f32[None, :, :]).reshape(2, -1)
+            e = [e_result[i, :] for i in range(2)]
         elif e.ndim == 3:
-            modulation = self.modulation[:, :, None, :]  # [1, 2, 1, dim]
-            e = (modulation + e[None, :, :, :]).reshape(e.shape[0], 2, -1)
-            e = [e[:, i, :] for i in range(2)]
+            modulation = self.modulation[:, :, None, :].astype(jnp.float32)  # [1, 2, 1, dim]
+            e_f32 = e.astype(jnp.float32)
+            e_result = (modulation + e_f32[None, :, :, :]).reshape(e.shape[0], 2, -1)
+            e = [e_result[:, i, :] for i in range(2)]
         
-        x = self.head(self.norm(x) * (1 + e[1]) + e[0])
-        return x
+        # Perform head computation in float32 to match PyTorch autocast
+        x_f32 = x.astype(jnp.float32)
+        norm_x_f32 = self.norm(x_f32)
+        e0_f32 = e[0].astype(jnp.float32)
+        e1_f32 = e[1].astype(jnp.float32)
+        head_input = norm_x_f32 * (1 + e1_f32) + e0_f32
+        result = self.head(head_input)
+        return result.astype(orig_dtype)
 
 
 class MLPProj(nnx.Module):
@@ -415,7 +432,7 @@ class MLPProj(nnx.Module):
         # Apply the layers sequentially, just like nn.Sequential.
         x = self.proj[0](image_embeds)
         x = self.proj[1](x)
-        x = jax.nn.gelu(x, approximate=True) # Apply GELU activation.
+        x = jax.nn.gelu(x, approximate=False) # Apply exact GELU activation to match PyTorch
         x = self.proj[2](x) # Corresponds to index 3 in PyTorch
         x = self.proj[3](x) # Corresponds to index 4 in PyTorch
         return x
@@ -516,7 +533,8 @@ class WanModel(nnx.Module):
         self, 
         x: jax.Array, 
         t: jax.Array, 
-        context: jax.Array, 
+        context: jax.Array,
+        grid_sizes: Tuple[int, int, int],
         clip_fea: Optional[jax.Array] = None, 
         y: Optional[jax.Array] = None, 
         fps: Optional[int] = None
@@ -528,6 +546,7 @@ class WanModel(nnx.Module):
             x: Input video tensor of shape [batch, in_dim, F, H, W]
             t: Diffusion timesteps tensor of shape [batch] or [batch, frames]
             context: Text embeddings of shape [batch, text_len, text_dim]
+            grid_sizes: The static spatial-temporal dimensions of the patched input (F, H, W).
             clip_fea: CLIP image features for i2v mode
             y: Conditional video inputs for i2v mode
             fps: FPS information for sample injection
@@ -544,7 +563,8 @@ class WanModel(nnx.Module):
         
         # Patch embedding
         x = self.patch_embedding(x)
-        grid_sizes = jnp.array(x.shape[2:], dtype=jnp.int32)
+        # REMOVED: grid_sizes is now provided as a static argument.
+        # grid_sizes = jnp.array(x.shape[2:], dtype=jnp.int32)
         x = x.reshape(x.shape[0], x.shape[1], -1).transpose(0, 2, 1)
         
         # Time embeddings
@@ -566,6 +586,7 @@ class WanModel(nnx.Module):
         e0 = e0.astype(jnp.float32)
         
         if self.inject_sample_info and fps is not None:
+            # Note: For JiT, 'fps' should also be treated as a static argument if it changes.
             fps_tensor = jnp.array(fps, dtype=jnp.int32)
             fps_emb = self.fps_embedding(fps_tensor).astype(jnp.float32)
             fps_proj = self.fps_projection_1(fps_emb)
@@ -577,10 +598,12 @@ class WanModel(nnx.Module):
                 e0 = e0 + fps_proj.reshape(6, self.dim)
         
         if _flag_df:
+            # Here, grid_sizes is a tuple (F, H, W), so we access elements directly.
+            patched_f, patched_h, patched_w = grid_sizes
             e = e.reshape(b, f, 1, 1, self.dim)
             e0 = e0.reshape(b, f, 1, 1, 6, self.dim)
-            e = e.repeat(1, 1, grid_sizes[1], grid_sizes[2], 1).reshape(b, -1, self.dim)
-            e0 = e0.repeat(1, 1, grid_sizes[1], grid_sizes[2], 1, 1).reshape(b, -1, 6, self.dim)
+            e = e.repeat(1, 1, patched_h, patched_w, 1).reshape(b, -1, self.dim)
+            e0 = e0.repeat(1, 1, patched_h, patched_w, 1, 1).reshape(b, -1, 6, self.dim)
             e0 = e0.transpose(1, 2)
         
         # Context processing
@@ -610,13 +633,13 @@ class WanModel(nnx.Module):
             x = x.astype(jnp.float32)
         return x
     
-    def unpatchify(self, x: jax.Array, grid_sizes: jax.Array) -> jax.Array:
+    def unpatchify(self, x: jax.Array, grid_sizes: Tuple[int, int, int]) -> jax.Array:
         """
         Reconstruct video tensors from patch embeddings.
         
         Args:
             x: Patchified features of shape [batch, seq_len, out_dim * prod(patch_size)]
-            grid_sizes: Original spatial-temporal grid dimensions [F, H, W]
+            grid_sizes: Original spatial-temporal grid dimensions (F, H, W).
             
         Returns:
             Reconstructed video tensor of shape [batch, out_dim, F, H//8, W//8]
