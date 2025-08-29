@@ -20,6 +20,7 @@ from tqdm import tqdm
 import cv2
 from skimage.metrics import structural_similarity as ssim
 from skimage.metrics import peak_signal_noise_ratio as psnr
+import glob
 
 # Add paths
 sys.path.append('.')
@@ -31,14 +32,64 @@ from skyreels_v2_infer.pipelines import Image2VideoPipeline
 from skyreels_v2_infer.pipelines import resizecrop
 
 
-def run_torch_generation(args):
+def discover_test_cases(batch_folder):
+    """Discover image/prompt pairs in a folder."""
+    print(f"\n🔍 Discovering test cases in: {batch_folder}")
+    
+    # Supported image extensions
+    image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp']
+    
+    test_cases = []
+    
+    # Find all text files (prompts)
+    prompt_files = glob.glob(os.path.join(batch_folder, "*.txt"))
+    
+    for prompt_file in sorted(prompt_files):
+        base_name = os.path.splitext(prompt_file)[0]
+        
+        # Look for corresponding image file
+        image_file = None
+        for ext in image_extensions:
+            candidate = base_name + ext
+            if os.path.exists(candidate):
+                image_file = candidate
+                break
+        
+        if image_file:
+            # Read prompt
+            with open(prompt_file, 'r', encoding='utf-8') as f:
+                prompt = f.read().strip()
+            
+            test_case = {
+                'name': os.path.basename(base_name),
+                'image_path': image_file,
+                'prompt': prompt,
+                'prompt_file': prompt_file
+            }
+            test_cases.append(test_case)
+            print(f"  ✅ Found: {test_case['name']}")
+        else:
+            print(f"  ⚠️  No image found for prompt: {os.path.basename(prompt_file)}")
+    
+    print(f"\n📊 Total test cases found: {len(test_cases)}")
+    return test_cases
+
+
+def run_torch_generation(args, test_case=None):
     """Run PyTorch generation."""
     print("\n" + "="*60)
     print("🔥 Running PyTorch Generation")
     print("="*60)
     
     # Load image
-    image = load_image(args.image).convert("RGB")
+    if test_case:
+        image = load_image(test_case['image_path']).convert("RGB")
+        prompt = test_case['prompt']
+        print(f"Processing: {test_case['name']}")
+        print(f"Prompt: {prompt}")
+    else:
+        image = load_image(args.image).convert("RGB")
+        prompt = args.prompt
     if args.resolution == "540P":
         height = 544
         width = 960
@@ -68,7 +119,7 @@ def run_torch_generation(args):
     
     with torch.cuda.amp.autocast(dtype=pipe.transformer.dtype), torch.no_grad():
         video_frames = pipe(
-            prompt=args.prompt,
+            prompt=prompt,
             image=image,
             negative_prompt=negative_prompt,
             num_frames=args.num_frames,
@@ -91,7 +142,7 @@ def run_torch_generation(args):
     return video_frames, torch_time
 
 
-def run_jax_generation(args):
+def run_jax_generation(args, test_case=None):
     """Run JAX generation with custom pipeline."""
     print("\n" + "="*60)
     print("🚀 Running JAX Generation (Optimized)")
@@ -108,7 +159,14 @@ def run_jax_generation(args):
     from test_jax_generation_optimized import JAXImage2VideoPipelineOptimized as JAXImage2VideoPipeline
     
     # Load image
-    image = load_image(args.image).convert("RGB")
+    if test_case:
+        image = load_image(test_case['image_path']).convert("RGB")
+        prompt = test_case['prompt']
+        print(f"Processing: {test_case['name']}")
+        print(f"Prompt: {prompt}")
+    else:
+        image = load_image(args.image).convert("RGB")
+        prompt = args.prompt
     if args.resolution == "540P":
         height = 544
         width = 960
@@ -137,7 +195,7 @@ def run_jax_generation(args):
     start_time = time.time()
     
     video_frames = pipe(
-        prompt=args.prompt,
+        prompt=prompt,
         image=image,
         negative_prompt=negative_prompt,
         num_frames=args.num_frames,
@@ -340,7 +398,7 @@ def main():
     parser = argparse.ArgumentParser(description="Compare JAX vs PyTorch generation")
     parser.add_argument("--model_id", type=str, default="Skywork/SkyReels-V2-I2V-1.3B-540P")
     parser.add_argument("--resolution", type=str, choices=["540P", "720P"], default="540P")
-    parser.add_argument("--num_frames", type=int, default=17)
+    parser.add_argument("--num_frames", type=int, default=13)
     parser.add_argument("--image", type=str, default="test_image.jpg")
     parser.add_argument("--guidance_scale", type=float, default=6.0)
     parser.add_argument("--shift", type=float, default=8.0)
@@ -353,12 +411,146 @@ def main():
     parser.add_argument("--torch_only", action="store_true", help="Only run PyTorch")
     parser.add_argument("--jax_only", action="store_true", help="Only run JAX")
     
+    # Batch processing arguments
+    parser.add_argument("--batch_folder", type=str, help="Folder containing image/prompt pairs for batch processing")
+    parser.add_argument("--batch_output", type=str, default="result/batch_comparison", 
+                       help="Output folder for batch comparison results")
+    
     args = parser.parse_args()
     
     # Download model
     args.model_path = download_model(args.model_id)
     print(f"Model path: {args.model_path}")
     
+    # Handle batch processing
+    if args.batch_folder:
+        # Batch processing mode
+        test_cases = discover_test_cases(args.batch_folder)
+        if not test_cases:
+            print("❌ No test cases found in batch folder!")
+            return
+        
+        # Create batch output directory
+        os.makedirs(args.batch_output, exist_ok=True)
+        
+        print(f"\n🚀 Starting batch processing of {len(test_cases)} test cases...")
+        
+        all_results = []
+        
+        for i, test_case in enumerate(test_cases):
+            print(f"\n{'='*60}")
+            print(f"Processing {i+1}/{len(test_cases)}: {test_case['name']}")
+            print(f"{'='*60}")
+            
+            torch_frames = None
+            jax_frames = None
+            torch_time = 0
+            jax_time = 0
+            
+            # Create case-specific output directory
+            case_output_dir = os.path.join(args.batch_output, test_case['name'])
+            os.makedirs(case_output_dir, exist_ok=True)
+            
+            # Run PyTorch generation
+            if not args.jax_only:
+                try:
+                    torch_frames, torch_time = run_torch_generation(args, test_case)
+                    # Save PyTorch video
+                    torch_path = os.path.join(case_output_dir, "pytorch_output.mp4")
+                    imageio.mimwrite(torch_path, torch_frames, fps=args.fps, quality=8)
+                    print(f"Saved PyTorch video to: {torch_path}")
+                except Exception as e:
+                    print(f"❌ PyTorch generation failed for {test_case['name']}: {e}")
+                    if args.torch_only:
+                        continue
+            
+            # Run JAX generation
+            if not args.torch_only:
+                try:
+                    # Set JAX memory allocation
+                    os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+                    jax_frames, jax_time = run_jax_generation(args, test_case)
+                    # Save JAX video
+                    jax_path = os.path.join(case_output_dir, "jax_output.mp4")
+                    imageio.mimwrite(jax_path, jax_frames, fps=args.fps, quality=8)
+                    print(f"Saved JAX video to: {jax_path}")
+                except Exception as e:
+                    print(f"❌ JAX generation failed for {test_case['name']}: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    if args.jax_only:
+                        continue
+            
+            # Create comparison if both succeeded
+            if torch_frames is not None and jax_frames is not None:
+                # Compute numerical metrics
+                metrics = compute_video_metrics(torch_frames, jax_frames)
+                
+                # Create side-by-side video
+                comparison_path = os.path.join(case_output_dir, "side_by_side_comparison.mp4")
+                create_side_by_side_video(torch_frames, jax_frames, comparison_path, args.fps)
+                
+                # Store results
+                result = {
+                    'name': test_case['name'],
+                    'prompt': test_case['prompt'],
+                    'torch_time': torch_time,
+                    'jax_time': jax_time,
+                    'metrics': metrics
+                }
+                all_results.append(result)
+        
+        # Print batch summary
+        print(f"\n{'='*60}")
+        print("🎯 BATCH PROCESSING SUMMARY")
+        print(f"{'='*60}")
+        
+        if all_results:
+            total_torch_time = sum(r['torch_time'] for r in all_results)
+            total_jax_time = sum(r['jax_time'] for r in all_results)
+            avg_psnr = np.mean([r['metrics']['mean_psnr'] for r in all_results])
+            avg_ssim = np.mean([r['metrics']['mean_ssim'] for r in all_results])
+            avg_mse = np.mean([r['metrics']['mean_mse'] for r in all_results])
+            
+            print(f"Processed: {len(all_results)}/{len(test_cases)} test cases")
+            print(f"Total PyTorch time: {total_torch_time:.2f}s")
+            print(f"Total JAX time: {total_jax_time:.2f}s")
+            if total_jax_time > 0:
+                speedup = total_torch_time / total_jax_time
+                print(f"Overall speedup: {speedup:.2f}x {'JAX' if speedup > 1 else 'PyTorch'}")
+            
+            print(f"\nAverage Quality Metrics:")
+            print(f"  PSNR: {avg_psnr:.2f} dB")
+            print(f"  SSIM: {avg_ssim:.4f}")
+            print(f"  MSE:  {avg_mse:.6f}")
+            
+            # Save summary to file
+            summary_path = os.path.join(args.batch_output, "batch_summary.txt")
+            with open(summary_path, 'w') as f:
+                f.write("BATCH PROCESSING SUMMARY\n")
+                f.write("="*60 + "\n\n")
+                for result in all_results:
+                    f.write(f"Test Case: {result['name']}\n")
+                    f.write(f"Prompt: {result['prompt']}\n")
+                    f.write(f"PyTorch Time: {result['torch_time']:.2f}s\n")
+                    f.write(f"JAX Time: {result['jax_time']:.2f}s\n")
+                    f.write(f"PSNR: {result['metrics']['mean_psnr']:.2f} dB\n")
+                    f.write(f"SSIM: {result['metrics']['mean_ssim']:.4f}\n")
+                    f.write(f"MSE: {result['metrics']['mean_mse']:.6f}\n")
+                    f.write("-" * 40 + "\n")
+                f.write(f"\nOverall Statistics:\n")
+                f.write(f"Total PyTorch time: {total_torch_time:.2f}s\n")
+                f.write(f"Total JAX time: {total_jax_time:.2f}s\n")
+                f.write(f"Average PSNR: {avg_psnr:.2f} dB\n")
+                f.write(f"Average SSIM: {avg_ssim:.4f}\n")
+                f.write(f"Average MSE: {avg_mse:.6f}\n")
+            
+            print(f"\nSummary saved to: {summary_path}")
+        
+        print("\n✅ Batch processing complete!")
+        return
+    
+    # Single case processing mode (original behavior)
     # Create output directory
     os.makedirs("result/comparison", exist_ok=True)
     

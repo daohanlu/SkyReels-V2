@@ -5,6 +5,9 @@ from flax import nnx
 from functools import partial
 import os
 
+# Enable float64 types for higher precision - this only works on startup!
+jax.config.update("jax_enable_x64", True)
+
 # Import memory-efficient attention if enabled
 USE_MEMORY_EFFICIENT_ATTENTION = os.environ.get("JAX_MEMORY_EFFICIENT_ATTENTION", "true").lower() == "true"
 if USE_MEMORY_EFFICIENT_ATTENTION:
@@ -52,7 +55,8 @@ def attention(
     deterministic: bool = True,
 ) -> jax.Array:
     """
-    Attention implementation with optional memory-efficient mode.
+    Attention implementation matching PyTorch's flash attention behavior.
+    Uses bfloat16 by default like PyTorch's flash attention implementation.
     
     Args:
         q: Query tensor of shape [batch, seq_len, num_heads, head_dim]
@@ -66,31 +70,47 @@ def attention(
     Returns:
         Attention output of shape [batch, seq_len, num_heads, head_dim]
     """
+    # Store original dtype
+    orig_dtype = q.dtype
+    
+    # Convert to bfloat16 to match PyTorch's flash attention default behavior
+    # PyTorch flash attention typically uses bfloat16 for efficiency
+    if orig_dtype != jnp.bfloat16:
+        q = q.astype(jnp.bfloat16)
+        k = k.astype(jnp.bfloat16)
+        v = v.astype(jnp.bfloat16)
+    
     # Use memory-efficient attention if enabled
     if USE_MEMORY_EFFICIENT_ATTENTION:
-        return memory_efficient_attention(
+        result = memory_efficient_attention(
             q, k, v, causal=causal, dropout_p=dropout_p,
             softmax_scale=softmax_scale, deterministic=deterministic,
             use_flash=False, chunk_size=256  # Use chunked attention with smaller chunks
         )
-    
-    # Otherwise use standard implementation
-    # Check unsupported arguments (outside of JIT-compiled function)
-    if dropout_p != 0.0:
-        raise ValueError("dropout_p must be 0.0, dropout is not supported in this implementation")
-    
-    if softmax_scale is not None:
-        raise ValueError("softmax_scale must be None, custom scaling is not supported in this implementation")
-    
-    # Use JAX's optimized dot_product_attention
-    if causal:
-        return _attention_causal(q, k, v)
     else:
-        return _attention_non_causal(q, k, v)
+        # Otherwise use standard implementation
+        # Check unsupported arguments (outside of JIT-compiled function)
+        if dropout_p != 0.0:
+            raise ValueError("dropout_p must be 0.0, dropout is not supported in this implementation")
+        
+        if softmax_scale is not None:
+            raise ValueError("softmax_scale must be None, custom scaling is not supported in this implementation")
+        
+        # Use JAX's optimized dot_product_attention
+        if causal:
+            result = _attention_causal(q, k, v)
+        else:
+            result = _attention_non_causal(q, k, v)
+    
+    # Convert back to original dtype if needed
+    if result.dtype != orig_dtype:
+        result = result.astype(orig_dtype)
+    
+    return result
 
 
 class WanRMSNorm(nnx.Module):
-    """RMS normalization layer."""
+    """RMS normalization layer matching PyTorch's fast_rms_norm behavior."""
     
     def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
@@ -102,9 +122,23 @@ class WanRMSNorm(nnx.Module):
         """
         Args:
             x: Input tensor of shape [batch, seq_len, dim]
+        
+        Matches PyTorch's fast_rms_norm implementation:
+        x = x.float()
+        x = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
+        x = x.type_as(x) * weight
         """
         orig_dtype = x.dtype
-        x = x.astype(jnp.float32)
-        x = x * jax.lax.rsqrt(jnp.mean(x**2, axis=-1, keepdims=True) + self.eps)
-        x = x.astype(orig_dtype) * self.weight
-        return x
+        
+        # Force float32 calculation to match PyTorch's fast_rms_norm
+        x_f32 = x.astype(jnp.float32)
+        
+        # Compute RMS normalization in float32
+        variance = jnp.mean(x_f32**2, axis=-1, keepdims=True)
+        x_normalized = x_f32 * jax.lax.rsqrt(variance + self.eps)
+        
+        # Convert back to original dtype and apply weight scaling
+        # This matches PyTorch's "x.type_as(x) * weight" behavior
+        x_result = x_normalized.astype(orig_dtype) * self.weight.astype(orig_dtype)
+        
+        return x_result

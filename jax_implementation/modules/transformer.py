@@ -7,6 +7,9 @@ from flax import nnx
 from .attention import WanRMSNorm, attention
 from .utils import sinusoidal_embedding_1d, rope_params, rope_apply, mul_add, mul_add_add
 
+# Enable float64 types for higher precision - this only works on startup!
+jax.config.update("jax_enable_x64", True)
+
 
 class WanLayerNorm(nnx.LayerNorm):
     """
@@ -159,29 +162,34 @@ class WanSelfAttention(nnx.Module):
     ) -> jax.Array:
         """
         Args:
-            x: Input tensor of shape [batch, seq_len, dim]
+            x: Input tensor of shape [batch, seq_len, dim] - can be float32 or bfloat16
             grid_sizes: Static grid sizes (F, H, W) for RoPE.
             freqs: RoPE frequency parameters
             block_mask: Optional attention mask
         """
         b, n, d = x.shape[0], self.num_heads, self.head_dim
         
+        # Convert to model weight dtype for linear operations
+        x_typed = x.astype(self.q.kernel.value.dtype)  # Convert to bfloat16 for weights
+        
         # Compute query, key, value
-        q = self.norm_q(self.q(x)).reshape(b, -1, n, d)
-        k = self.norm_k(self.k(x)).reshape(b, -1, n, d)
-        v = self.v(x).reshape(b, -1, n, d)
+        q = self.norm_q(self.q(x_typed)).reshape(b, -1, n, d)
+        k = self.norm_k(self.k(x_typed)).reshape(b, -1, n, d)
+        v = self.v(x_typed).reshape(b, -1, n, d)
         
         # Apply RoPE
         q = rope_apply(q, grid_sizes, freqs)
         k = rope_apply(k, grid_sizes, freqs)
         
         # Compute attention
-        x = attention(q, k, v)
+        attn_out = attention(q, k, v)
         
         # Output
-        x = x.reshape(b, -1, self.dim)
-        x = self.o(x)
-        return x
+        attn_out = attn_out.reshape(b, -1, self.dim)
+        output = self.o(attn_out)
+        
+        # Return in same dtype as input for consistency
+        return output.astype(x.dtype)
 
 
 class WanI2VCrossAttention(WanSelfAttention):
@@ -317,45 +325,55 @@ class WanAttentionBlock(nnx.Module):
             context: Context tensor for cross-attention
             block_mask: Optional attention mask
         """
-        # Handle modulation - use float32 precision like PyTorch autocast
+        # Handle modulation - use float32 precision to match PyTorch's autocast behavior
+        # PyTorch uses "with amp.autocast("cuda", dtype=torch.float32)" for modulation
         if e.ndim == 3: # Shape is [B, 6, dim]
             modulation = self.modulation
-            # Perform modulation arithmetic in float32 to match PyTorch autocast
+            # Perform modulation arithmetic in float32 to match PyTorch autocast behavior
             e_f32 = e.astype(jnp.float32)
             modulation_f32 = modulation.astype(jnp.float32)
             e_result = modulation_f32 + e_f32
             # Split along dim=1 to match PyTorch's chunk(6, dim=1)
             # e has shape [B, 6, dim], split into 6 parts of [B, 1, dim]
             e_split = jnp.split(e_result, 6, axis=1)
-            # Squeeze to get [B, dim] for each part, convert back to original dtype
-            e = [jnp.squeeze(ei, axis=1).astype(e.dtype) for ei in e_split]
+            # Squeeze to get [B, dim] for each part
+            # Keep in float32 initially since mul_add operations expect float32
+            e = [jnp.squeeze(ei, axis=1) for ei in e_split]
         elif e.ndim == 4: # Shape is [B, seq_len, 6, dim]
             modulation = self.modulation[:, None, :, :] # Shape becomes [1, 1, 6, dim]
-            # Perform modulation arithmetic in float32 to match PyTorch autocast
+            # Perform modulation arithmetic in float32 to match PyTorch autocast behavior
             e_f32 = e.astype(jnp.float32)
             modulation_f32 = modulation.astype(jnp.float32)
             e_result = modulation_f32 + e_f32
             # Split along dim=2 (the 6 dimension)
             e_split = jnp.split(e_result, 6, axis=2)
-            # Squeeze to get [B, seq_len, dim] for each part, convert back to original dtype
-            e = [jnp.squeeze(ei, axis=2).astype(e.dtype) for ei in e_split]
+            # Squeeze to get [B, seq_len, dim] for each part
+            # Keep in float32 initially since mul_add operations expect float32
+            e = [jnp.squeeze(ei, axis=2) for ei in e_split]
         
         # Self-attention
-        out = mul_add_add(self.norm1(x), e[1], e[0])
-        y = self.self_attn(out, grid_sizes, freqs, block_mask)
-        x = mul_add(x, y, e[2])
+        out = mul_add_add(self.norm1(x), e[1], e[0])  # Returns float32
+        y = self.self_attn(out, grid_sizes, freqs, block_mask)  # Handles float32 input
+        x = mul_add(x, y, e[2])  # Returns float32
         
         # Cross-attention & FFN
         def cross_attn_ffn(x, context, e):
-            # Convert x to context dtype (bfloat16) before cross-attention, matching PyTorch
-            x_bf16 = x.astype(context.dtype) if x.dtype != context.dtype else x
-            x = x + self.cross_attn(self.norm3(x_bf16), context)
-            y = self.ffn_2(jax.nn.gelu(self.ffn_1(mul_add_add(self.norm2(x), e[4], e[3])), approximate=True))
-            x = mul_add(x, y, e[5])
+            # x is now in float32 from mul_add - convert to bfloat16 for cross-attention
+            x_bf16 = x.astype(context.dtype)
+            x_residual = x + self.cross_attn(self.norm3(x_bf16), context)
+            
+            # FFN computation - mul_add_add returns float32 like PyTorch
+            ffn_input = mul_add_add(self.norm2(x_residual), e[4], e[3])  # Returns float32
+            # Convert to bfloat16 for FFN layers to match weight dtype
+            ffn_input_bf16 = ffn_input.astype(context.dtype)
+            y = self.ffn_2(jax.nn.gelu(self.ffn_1(ffn_input_bf16), approximate=True))
+            
+            # Final mul_add operation returns float32
+            x = mul_add(x_residual, y, e[5])  # Returns float32
             return x
         
         x = cross_attn_ffn(x, context, e)
-        return x  # Don't force dtype conversion
+        return x.astype(jnp.bfloat16)  # Convert to bfloat16 to match PyTorch behavior
 
 
 class Head(nnx.Module):
@@ -382,9 +400,15 @@ class Head(nnx.Module):
         Args:
             x: Input tensor of shape [batch, seq_len, dim]
             e: Time embeddings of shape [batch, dim] or [batch, seq_len, dim]
+        
+        Matches PyTorch's Head forward pass which uses:
+        with amp.autocast("cuda", dtype=torch.float32):
+            x = self.head(self.norm(x) * (1 + e[1]) + e[0])
         """
-        # Perform modulation arithmetic in float32 to match PyTorch autocast
+        # Store original dtype
         orig_dtype = x.dtype
+        
+        # Perform modulation arithmetic in float32 to match PyTorch autocast
         if e.ndim == 2:
             modulation = self.modulation.astype(jnp.float32)  # [1, 2, dim]
             e_f32 = e.astype(jnp.float32)
@@ -396,14 +420,21 @@ class Head(nnx.Module):
             e_result = (modulation + e_f32[None, :, :, :]).reshape(e.shape[0], 2, -1)
             e = [e_result[:, i, :] for i in range(2)]
         
-        # Perform head computation in float32 to match PyTorch autocast
+        # Perform ALL head computation in float32 to match PyTorch's autocast behavior
+        # PyTorch: "with amp.autocast("cuda", dtype=torch.float32):"
         x_f32 = x.astype(jnp.float32)
-        norm_x_f32 = self.norm(x_f32)
+        norm_x_f32 = self.norm(x_f32)  # LayerNorm computation in float32
         e0_f32 = e[0].astype(jnp.float32)
         e1_f32 = e[1].astype(jnp.float32)
-        head_input = norm_x_f32 * (1 + e1_f32) + e0_f32
-        result = self.head(head_input)
-        return result.astype(orig_dtype)
+        
+        # The complete expression in float32: norm(x) * (1 + e[1]) + e[0] 
+        head_input_f32 = norm_x_f32 * (1.0 + e1_f32) + e0_f32
+        
+        # Apply final linear layer in float32
+        result_f32 = self.head(head_input_f32)
+        
+        # Convert back to original dtype for compatibility
+        return result_f32.astype(orig_dtype)
 
 
 class MLPProj(nnx.Module):
@@ -567,7 +598,7 @@ class WanModel(nnx.Module):
         # grid_sizes = jnp.array(x.shape[2:], dtype=jnp.int32)
         x = x.reshape(x.shape[0], x.shape[1], -1).transpose(0, 2, 1)
         
-        # Time embeddings
+        # Time embeddings - Force float32 computation to match PyTorch's autocast behavior
         if t.ndim == 2:
             b, f = t.shape
             _flag_df = True
@@ -575,23 +606,33 @@ class WanModel(nnx.Module):
             b = t.shape[0]
             _flag_df = False
         
-        e = self.time_embedding_1(
-            sinusoidal_embedding_1d(self.freq_dim, t.reshape(-1))
-        )  # [batch, dim]
-        e = jax.nn.silu(e)
-        e = self.time_embedding_2(e)
-        e0 = jax.nn.silu(e)
-        e0 = self.time_projection_1(e0).reshape(b, 6, self.dim)  # [batch, 6, dim]
+        # PyTorch's autocast behavior is nuanced: it forces float32 for certain operations but allows
+        # linear layers to use their native precision (bfloat16). We need to match this exactly.
+        sinusoidal_emb = sinusoidal_embedding_1d(self.freq_dim, t.reshape(-1))
+        # Convert to bfloat16 to match PyTorch model's precision behavior
+        sinusoidal_emb = sinusoidal_emb.astype(jnp.bfloat16)
+        
+        # Linear layers operate in their native precision (bfloat16) to match PyTorch
+        e = self.time_embedding_1(sinusoidal_emb)  # [batch, dim] - stays bfloat16
+        e = jax.nn.silu(e)  # Activation stays in bfloat16
+        e = self.time_embedding_2(e)  # stays bfloat16
+        e0 = jax.nn.silu(e)  # stays bfloat16
+        e0 = self.time_projection_1(e0).reshape(b, 6, self.dim)  # [batch, 6, dim] - stays bfloat16
+        
+        # Convert to float32 only for the modulation arithmetic to match PyTorch's autocast
         e = e.astype(jnp.float32)
         e0 = e0.astype(jnp.float32)
         
         if self.inject_sample_info and fps is not None:
             # Note: For JiT, 'fps' should also be treated as a static argument if it changes.
+            # Match PyTorch's linear layer precision behavior (bfloat16 for layers, float32 for arithmetic)
             fps_tensor = jnp.array(fps, dtype=jnp.int32)
-            fps_emb = self.fps_embedding(fps_tensor).astype(jnp.float32)
-            fps_proj = self.fps_projection_1(fps_emb)
-            fps_proj = jax.nn.silu(fps_proj)
-            fps_proj = self.fps_projection_2(fps_proj)
+            fps_emb = self.fps_embedding(fps_tensor)  # Embedding stays in its native precision
+            fps_proj = self.fps_projection_1(fps_emb)  # Linear layer in bfloat16
+            fps_proj = jax.nn.silu(fps_proj)  # Activation in bfloat16
+            fps_proj = self.fps_projection_2(fps_proj)  # Linear layer in bfloat16
+            # Convert to float32 for arithmetic operation with e0 (which is already float32)
+            fps_proj = fps_proj.astype(jnp.float32)
             if _flag_df:
                 e0 = e0 + fps_proj.reshape(6, self.dim)[None, :, :].repeat(t.shape[1], axis=0)
             else:
@@ -606,10 +647,10 @@ class WanModel(nnx.Module):
             e0 = e0.repeat(1, 1, patched_h, patched_w, 1, 1).reshape(b, -1, 6, self.dim)
             e0 = e0.transpose(1, 2)
         
-        # Context processing
-        context = self.text_embedding_1(context)
-        context = jax.nn.gelu(context, approximate=True)
-        context = self.text_embedding_2(context)
+        # Context processing - match PyTorch's linear layer precision behavior
+        context = self.text_embedding_1(context)  # Linear layer stays in bfloat16
+        context = jax.nn.gelu(context, approximate=True)  # Activation in bfloat16  
+        context = self.text_embedding_2(context)  # Linear layer stays in bfloat16
         
         if clip_fea is not None:
             context_clip = self.img_emb(clip_fea)  # [batch, 257, dim]

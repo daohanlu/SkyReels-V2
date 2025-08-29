@@ -3,10 +3,14 @@ import jax
 import jax.numpy as jnp
 from typing import Tuple
 
+# Enable float64 types for higher precision - this only works on startup!
+jax.config.update("jax_enable_x64", True)
+
 
 def sinusoidal_embedding_1d(dim: int, position: jax.Array) -> jax.Array:
     """
     Create sinusoidal positional embeddings for 1D sequences.
+    Force float64 calculation to match PyTorch's precision and avoid numerical errors.
     
     Args:
         dim: Embedding dimension (must be even)
@@ -18,26 +22,27 @@ def sinusoidal_embedding_1d(dim: int, position: jax.Array) -> jax.Array:
     assert dim % 2 == 0, "Dimension must be even"
     half = dim // 2
     
-    # Use float64 if available (requires jax.config.update('jax_enable_x64', True))
-    # Otherwise falls back to float32
-    try:
-        position = position.astype(jnp.float64)
-        dtype = jnp.float64
-    except:
-        position = position.astype(jnp.float32)
-        dtype = jnp.float32
+    # Force float64 calculation for precision to match PyTorch's implementation
+    # PyTorch uses float64 for sinusoidal embeddings in certain cases
+    position = position.astype(jnp.float64)
+    dtype = jnp.float64
     
-    # Calculate sinusoidal embeddings matching PyTorch's implementation
-    freqs = jnp.outer(position, jnp.power(10000.0, -jnp.arange(half, dtype=dtype) / dtype(half)))
+    # Calculate sinusoidal embeddings matching PyTorch's implementation exactly
+    # Using jnp.power with float64 to match PyTorch's precision
+    freqs = jnp.outer(
+        position, 
+        jnp.power(10000.0, -jnp.arange(half, dtype=dtype) / jnp.float64(half))
+    )
     x = jnp.concatenate([jnp.cos(freqs), jnp.sin(freqs)], axis=1)
     
-    # Return in the computed dtype - will be converted to bfloat16 later as needed
+    # Return in float64 - will be converted to appropriate dtype later
     return x
 
 
 def rope_params(max_seq_len: int, dim: int, theta: float = 10000.0) -> jax.Array:
     """
     Generate RoPE (Rotary Position Embedding) parameters.
+    Force float32 calculation to match PyTorch's @amp.autocast("cuda", enabled=False).
     
     Args:
         max_seq_len: Maximum sequence length
@@ -49,13 +54,14 @@ def rope_params(max_seq_len: int, dim: int, theta: float = 10000.0) -> jax.Array
     """
     assert dim % 2 == 0, "Dimension must be even"
     
+    # Force float32 calculation to match PyTorch's disabled autocast
     freqs = jnp.outer(
-        jnp.arange(max_seq_len),
-        1.0 / jnp.power(theta, jnp.arange(0, dim, 2) / dim)
+        jnp.arange(max_seq_len, dtype=jnp.float32),
+        1.0 / jnp.power(theta, jnp.arange(0, dim, 2, dtype=jnp.float32) / jnp.float32(dim))
     )
     
-    # Convert to complex numbers
-    freqs = jnp.exp(1j * freqs)
+    # Convert to complex numbers using float32 precision
+    freqs = jnp.exp(1j * freqs.astype(jnp.complex64))  # complex64 = float32 real + float32 imag
     
     return freqs
 
@@ -63,6 +69,7 @@ def rope_params(max_seq_len: int, dim: int, theta: float = 10000.0) -> jax.Array
 def rope_apply(x: jax.Array, grid_sizes: jax.Array, freqs: jax.Array) -> jax.Array:
     """
     Applies 3D Rotary Position Embeddings (RoPE) to the input tensor using JAX.
+    Force float32 calculation to match PyTorch's @amp.autocast("cuda", enabled=False).
 
     This function extends 2D RoPE to 3D for video data by factorizing the
     embeddings across the frame, height, and width dimensions.
@@ -78,6 +85,9 @@ def rope_apply(x: jax.Array, grid_sizes: jax.Array, freqs: jax.Array) -> jax.Arr
     Returns:
         jax.Array: The tensor with RoPE applied, having the same shape as the input `x`.
     """
+    # Store original dtype for return
+    orig_dtype = x.dtype
+    
     # 1. Get dimensions from the input tensor
     # 'n' corresponds to num_heads, and 'c' is half of the head_dim
     bs, seq_len_from_x, n, head_dim = x.shape
@@ -97,7 +107,8 @@ def rope_apply(x: jax.Array, grid_sizes: jax.Array, freqs: jax.Array) -> jax.Arr
     # Use the actual sequence length from x's shape to avoid tracing issues
     seq_len = seq_len_from_x
     
-    # 4. Reshape the input to view pairs of values as complex numbers
+    # 4. Force float32 calculation to match PyTorch's disabled autocast
+    # Reshape the input to view pairs of values as complex numbers
     # Shape: (bs, seq_len, n, head_dim) -> (bs, seq_len, n, c, 2)
     x_reshaped = x.astype(jnp.float32).reshape(bs, seq_len, n, c, 2)
     # Shape: (bs, seq_len, n, c, 2) -> (bs, seq_len, n, c) [complex]
@@ -135,13 +146,14 @@ def rope_apply(x: jax.Array, grid_sizes: jax.Array, freqs: jax.Array) -> jax.Arr
     # Shape: (bs, seq_len, n, c, 2) -> (bs, seq_len, n, head_dim)
     output = rotated_x_real_parts.reshape(bs, seq_len, n, head_dim)
     
-    # Preserve original dtype
-    return output.astype(x.dtype)
+    # Return in original dtype
+    return output.astype(orig_dtype)
 
 
 def rope_apply_static(x: jax.Array, grid_sizes: Tuple[int, int, int], freqs: jax.Array) -> jax.Array:
     """
     Applies 3D Rotary Position Embeddings (RoPE) to the input tensor using JAX.
+    Force float32 calculation to match PyTorch's @amp.autocast("cuda", enabled=False).
 
     This function extends 2D RoPE to 3D for video data by factorizing the
     embeddings across the frame, height, and width dimensions.
@@ -161,6 +173,9 @@ def rope_apply_static(x: jax.Array, grid_sizes: Tuple[int, int, int], freqs: jax
     Returns:
         jax.Array: The tensor with RoPE applied, having the same shape as the input `x`.
     """
+    # Store original dtype for return
+    orig_dtype = x.dtype
+    
     # 1. Get dimensions from the input tensor
     # 'n' corresponds to num_heads, and 'c' is half of the head_dim
     bs, seq_len_from_x, n, head_dim = x.shape
@@ -183,7 +198,8 @@ def rope_apply_static(x: jax.Array, grid_sizes: Tuple[int, int, int], freqs: jax
             f"Input sequence length {seq_len_from_x} must match the product of grid_sizes {seq_len}."
         )
 
-    # 4. Reshape the input to view pairs of values as complex numbers
+    # 4. Force float32 calculation to match PyTorch's disabled autocast
+    # Reshape the input to view pairs of values as complex numbers
     # Shape: (bs, seq_len, n, head_dim) -> (bs, seq_len, n, c, 2)
     x_reshaped = x.astype(jnp.float32).reshape(bs, seq_len, n, c, 2)
     # Shape: (bs, seq_len, n, c, 2) -> (bs, seq_len, n, c) [complex]
@@ -222,8 +238,8 @@ def rope_apply_static(x: jax.Array, grid_sizes: Tuple[int, int, int], freqs: jax
     # Shape: (bs, seq_len, n, c, 2) -> (bs, seq_len, n, head_dim)
     output = rotated_x_real_parts.reshape(bs, seq_len, n, head_dim)
     
-    # Preserve original dtype
-    return output.astype(x.dtype)
+    # Return in original dtype
+    return output.astype(orig_dtype)
 
 
 def apply_rope_1d(x: jax.Array, freq: jax.Array) -> jax.Array:
@@ -255,23 +271,31 @@ def apply_rope_1d(x: jax.Array, freq: jax.Array) -> jax.Array:
 
 
 def mul_add(x: jax.Array, y: jax.Array, z: jax.Array) -> jax.Array:
-    """Element-wise multiplication and addition: x + y * z"""
-    orig_dtype = x.dtype
-    result = x.astype(jnp.float32) + y.astype(jnp.float32) * z.astype(jnp.float32)
-    return result.astype(orig_dtype)
+    """Element-wise multiplication and addition: x + y * z
+    
+    Matches PyTorch's compiled behavior: x.float() + y.float() * z.float()
+    IMPORTANT: PyTorch's compiled version returns float32, so we must do the same.
+    """
+    # Convert all inputs to float32 like PyTorch's compiled function
+    x_f32 = x.astype(jnp.float32)
+    y_f32 = y.astype(jnp.float32)
+    z_f32 = z.astype(jnp.float32)
+    result = x_f32 + y_f32 * z_f32
+    # Return in float32 to match PyTorch's compiled behavior - DO NOT convert back
+    return result
 
 
 def mul_add_add(x: jax.Array, y: jax.Array, z: jax.Array) -> jax.Array:
     """Element-wise operation: x * (1 + y) + z
     
-    Matches PyTorch's implementation: x.float() * (1 + y) + z
-    In PyTorch, precision promotion rules mean the entire expression is computed in float32
+    Matches PyTorch's compiled implementation: x.float() * (1 + y) + z
+    IMPORTANT: PyTorch's compiled version returns float32, so we must do the same.
     """
-    orig_dtype = x.dtype
-    # Convert all to float32 to match PyTorch's precision promotion behavior
+    # Convert all to float32 to match PyTorch's compiled precision behavior
     x_f32 = x.astype(jnp.float32)
     y_f32 = y.astype(jnp.float32)
     z_f32 = z.astype(jnp.float32)
-    result = x_f32 * (1 + y_f32) + z_f32
-    return result.astype(orig_dtype)
+    result = x_f32 * (1.0 + y_f32) + z_f32
+    # Return in float32 to match PyTorch's compiled behavior - DO NOT convert back
+    return result
 
