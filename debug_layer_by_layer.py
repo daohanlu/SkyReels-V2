@@ -2,6 +2,13 @@
 """
 Comprehensive layer-by-layer comparison of JAX vs PyTorch transformer forward pass.
 Tests all 30 transformer blocks with dimension-specific error analysis.
+
+Features:
+- Tests all 30 transformer blocks
+- Dimension exclusion analysis (with/without dimension 1188)
+- Error progression tracking and stability analysis
+- Comprehensive error distribution histograms
+- Saves detailed matplotlib visualization to 'error_distribution_analysis.png'
 """
 
 import os
@@ -11,6 +18,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from typing import Dict, Any
+import matplotlib.pyplot as plt
+import matplotlib
 
 # Enable float64 in JAX for better precision
 jax.config.update('jax_enable_x64', True)
@@ -295,7 +304,7 @@ def trace_forward_pass():
     
     print(f"\n{'Block':<5} {'Mean Full':<10} {'Max Full':<10} {'Mean Excl':<10} {'Max Excl':<10} {'Dim 1188 Impact':<15}")
     print("-" * 80)
-    
+        
     for i in range(config['num_layers']):
         with torch.no_grad():
             # PyTorch block forward
@@ -332,6 +341,127 @@ def trace_forward_pass():
         # Print detailed info for key blocks
         if i in [0, 4, 9, 14, 19, 24, 29]:
             print(f"    --> Block {i} worst_full={stats['worst_full']}, worst_excl={stats['worst_excl']}")
+        
+        # Generate error histogram for the final block
+        if i == config['num_layers'] - 1:  # Final block (block 29)
+            print(f"\nGenerating error distribution histogram for final block...")
+            
+            # Get the final error data
+            torch_final = x_torch_current.detach().cpu().float().numpy()
+            jax_final = np.array(x_jax_current).astype(np.float32)
+            abs_diff_final = np.abs(torch_final - jax_final)
+            
+            # Create histogram plots
+            matplotlib.use('Agg')  # Use non-interactive backend
+            
+            # Figure with subplots
+            fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+            fig.suptitle('Error Distribution Analysis - Final Block (Block 29)', fontsize=16, fontweight='bold')
+            
+            # 1. Overall error distribution
+            ax1 = axes[0, 0]
+            error_flat = abs_diff_final.flatten()
+            ax1.hist(error_flat, bins=50, alpha=0.7, color='blue', edgecolor='black')
+            ax1.set_xlabel('Absolute Error')
+            ax1.set_ylabel('Frequency')
+            ax1.set_title('Overall Error Distribution')
+            ax1.set_yscale('log')
+            ax1.grid(True, alpha=0.3)
+            
+            # Add statistics text
+            stats_text = f'Mean: {error_flat.mean():.6f}\nMedian: {np.median(error_flat):.6f}\nStd: {error_flat.std():.6f}\nMax: {error_flat.max():.6f}\nMin: {error_flat.min():.6f}'
+            ax1.text(0.65, 0.95, stats_text, transform=ax1.transAxes, verticalalignment='top',
+                    bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+            
+            # 2. Error distribution excluding dimension 1188
+            ax2 = axes[0, 1]
+            mask_excl = np.ones(abs_diff_final.shape, dtype=bool)
+            mask_excl[:, :, 1188] = False
+            error_excl_flat = abs_diff_final[mask_excl]
+            ax2.hist(error_excl_flat, bins=50, alpha=0.7, color='green', edgecolor='black')
+            ax2.set_xlabel('Absolute Error')
+            ax2.set_ylabel('Frequency')
+            ax2.set_title('Error Distribution (Excluding Dim 1188)')
+            ax2.set_yscale('log')
+            ax2.grid(True, alpha=0.3)
+            
+            # Add statistics text
+            stats_text_excl = f'Mean: {error_excl_flat.mean():.6f}\nMedian: {np.median(error_excl_flat):.6f}\nStd: {error_excl_flat.std():.6f}\nMax: {error_excl_flat.max():.6f}\nMin: {error_excl_flat.min():.6f}'
+            ax2.text(0.65, 0.95, stats_text_excl, transform=ax2.transAxes, verticalalignment='top',
+                    bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.8))
+            
+            # 3. Per-dimension error statistics
+            ax3 = axes[1, 0]
+            dim_max_errors = np.max(abs_diff_final, axis=(0, 1))  # Max error per dimension
+            ax3.bar(range(len(dim_max_errors)), dim_max_errors, alpha=0.7, color='red')
+            ax3.set_xlabel('Feature Dimension')
+            ax3.set_ylabel('Max Absolute Error')
+            ax3.set_title('Maximum Error per Feature Dimension')
+            ax3.grid(True, alpha=0.3)
+            
+            # Highlight dimension 1188
+            ax3.bar([1188], [dim_max_errors[1188]], color='orange', label='Dimension 1188')
+            ax3.legend()
+            
+            # 4. Top 20 worst dimensions
+            ax4 = axes[1, 1]
+            worst_dims = np.argsort(dim_max_errors)[-20:][::-1]  # Top 20
+            worst_errors = dim_max_errors[worst_dims]
+            colors = ['orange' if dim == 1188 else 'red' for dim in worst_dims]
+            
+            bars = ax4.bar(range(len(worst_dims)), worst_errors, alpha=0.7, color=colors)
+            ax4.set_xlabel('Dimension Rank (Worst to Best)')
+            ax4.set_ylabel('Max Absolute Error')
+            ax4.set_title('Top 20 Worst Dimensions')
+            ax4.grid(True, alpha=0.3)
+            
+            # Add dimension labels
+            dim_labels = [f'{dim}' for dim in worst_dims]
+            ax4.set_xticks(range(len(worst_dims)))
+            ax4.set_xticklabels(dim_labels, rotation=45, ha='right')
+            
+            # Add legend for colors
+            from matplotlib.patches import Patch
+            legend_elements = [Patch(facecolor='orange', label='Dimension 1188'),
+                             Patch(facecolor='red', label='Other Dimensions')]
+            ax4.legend(handles=legend_elements)
+            
+            plt.tight_layout()
+            
+            # Save the plot
+            output_path = 'error_distribution_analysis.png'
+            plt.savefig(output_path, dpi=300, bbox_inches='tight')
+            print(f"📊 Error distribution histogram saved to: {output_path}")
+            
+            # Print detailed statistics
+            print(f"\n" + "=" * 60)
+            print("ERROR DISTRIBUTION STATISTICS")
+            print("=" * 60)
+            
+            print(f"Overall error statistics:")
+            print(f"  Total elements: {error_flat.size:,}")
+            print(f"  Mean error: {error_flat.mean():.8f}")
+            print(f"  Std error: {error_flat.std():.8f}")
+            print(f"  Median error: {np.median(error_flat):.8f}")
+            print(f"  95th percentile: {np.percentile(error_flat, 95):.8f}")
+            print(f"  99th percentile: {np.percentile(error_flat, 99):.8f}")
+            print(f"  Max error: {error_flat.max():.8f}")
+            
+            print(f"\nExcluding dimension 1188:")
+            print(f"  Elements: {error_excl_flat.size:,}")
+            print(f"  Mean error: {error_excl_flat.mean():.8f}")
+            print(f"  Std error: {error_excl_flat.std():.8f}")
+            print(f"  Median error: {np.median(error_excl_flat):.8f}")
+            print(f"  95th percentile: {np.percentile(error_excl_flat, 95):.8f}")
+            print(f"  99th percentile: {np.percentile(error_excl_flat, 99):.8f}")
+            print(f"  Max error: {error_excl_flat.max():.8f}")
+            
+            print(f"\nTop 10 worst dimensions:")
+            for rank, dim in enumerate(worst_dims[:10]):
+                marker = "👑" if dim == 1188 else f"{rank+1:2d}."
+                print(f"  {marker} Dimension {dim:4d}: {dim_max_errors[dim]:.8f}")
+            
+            plt.close(fig)  # Close to free memory
     
     print("\n" + "=" * 80)
     print("COMPREHENSIVE ANALYSIS")
